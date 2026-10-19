@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ATE Run Chart Dashboard</title>
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">ATE Run Chart Dashboard</div>
+  <div class="topbar-progress" id="globalProgress" hidden>
+    <div class="bar"><div class="fill" id="globalProgressFill"></div></div>
+    <span id="globalProgressLabel"></span>
+  </div>
+  <div class="topbar-status" id="globalStatus">No data loaded. Drop CSV files to begin.</div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <section class="step">
+      <h2><span class="stepnum">1</span> Data files</h2>
+      <div class="dropzone" id="dropZone" tabindex="0">
+        <div class="dz-title">Drop CSV or MDB files here</div>
+        <div class="dz-sub">Machine from the file name: CATE1001, CATE1003, CATE1006, CATE1007, EVO1001, EVO1002, NATE1001. An .mdb loads every result table. A CSV loads one table (Sensitivity, MCBias, MuxAuxPS, Oscillation, SCPre, plus Noise, BTE, MEMSCurrent and MEMSSC on EVO testers, MCBias Current and Coil Present on NATE), or all of them when it is a bundle written by the export tools (CATE1001.csv, NATE1001.csv).</div>
+        <label class="btn btn-secondary">Browse<input type="file" id="fileInput" multiple accept=".csv,.mdb,.accdb,text/csv" hidden></label>
+      </div>
+      <table class="file-table" id="fileTable">
+        <thead><tr><th>Machine</th><th>File</th><th>Rows</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted small" id="ignoredFiles"></div>
+    </section>
+
+    <section class="step">
+      <h2><span class="stepnum">2</span> Date range</h2>
+      <div class="range-row">
+        <label>Start <input type="date" id="startDate"></label>
+        <label>End <input type="date" id="endDate"></label>
+      </div>
+      <div class="range-presets">
+        <button class="btn btn-small" data-preset="last7">Last 7 days of data</button>
+        <button class="btn btn-small" data-preset="last30">Last 30 days</button>
+        <button class="btn btn-small" data-preset="ytd">Year to date</button>
+        <button class="btn btn-small" data-preset="all">All data</button>
+      </div>
+      <details class="overrides" id="overridesBox">
+        <summary>Per-coil overrides <span class="badge" id="overrideCount">0</span></summary>
+        <div class="muted small">Coils listed here use their own range instead of the default above.</div>
+        <table class="override-table" id="overrideTable"><tbody></tbody></table>
+        <div class="override-add">
+          <select id="ovCoil" title="Coil (from the loaded CSV files)"><option value="">Select a coil…</option></select>
+          <input type="date" id="ovStart" title="Start">
+          <input type="date" id="ovEnd" title="End (blank = today)">
+          <button class="btn btn-small" id="ovAdd">Add</button>
+        </div>
+      </details>
+      <div class="error small" id="rangeError" hidden></div>
+    </section>
+
+    <section class="step step-coils">
+      <h2><span class="stepnum">3</span> Coils</h2>
+      <div class="coil-tools">
+        <button class="btn btn-primary" id="generateBtn" disabled>Generate</button>
+        <input type="search" id="coilSearch" placeholder="Filter coils" disabled>
+      </div>
+      <div class="muted small" id="coilSummary"></div>
+      <ul class="coil-list" id="coilList"></ul>
+    </section>
+  </aside>
+
+  <main class="main">
+    <div id="summaryView" class="summary">
+      <h1>Overview</h1>
+      <p class="muted">Everything runs inside this browser tab. Files are read into memory, charts are drawn on demand, and nothing is uploaded or saved anywhere. Closing the tab discards the data.</p>
+      <div id="coverage"></div>
+      <div id="chartSummary"></div>
+    </div>
+
+    <div id="viewer" class="viewer" hidden>
+      <div class="viewer-head">
+        <div>
+          <h1 id="viewerTitle"></h1>
+          <div class="muted" id="viewerMeta"></div>
+        </div>
+        <div class="viewer-actions">
+          <div class="segmented" role="tablist">
+            <button id="modeSingle" class="active" role="tab">Single</button>
+            <button id="modeLibrary" role="tab">Library</button>
+          </div>
+          <button class="btn btn-secondary" id="downloadAllBtn" title="Download every chart for this coil as a zip of PNGs">Download all (zip)</button>
+          <button class="btn btn-secondary" id="backBtn">Overview</button>
+        </div>
+      </div>
+      <div class="banner warn" id="partialBanner" hidden></div>
+      <div class="banner info" id="measureNote" hidden></div>
+      <div class="filters">
+        <label>Measurement <select id="fMeasure"></select></label>
+        <label>Machine <select id="fMachine"></select></label>
+        <label>Mode <select id="fMode"></select></label>
+        <label id="tcFilter">Test case <select id="fTc"></select></label>
+        <label id="netFilter" hidden><span id="netFilterLabel">Net</span> <select id="fNet"></select></label>
+        <label id="portFilter" hidden>Port <select id="fPort"></select></label>
+        <label>Outliers <select id="fOutliers"><option value="flag">Flag (off-scale band)</option><option value="exclude">Exclude</option><option value="off">Off</option></select></label>
+        <label>k (MAD) <input type="number" id="fK" min="1" max="20" step="0.5" title="Modified z-score threshold: |y - median| / (1.4826 x MAD) > k"></label>
+        <label class="check"><input type="checkbox" id="fStats"> Statistics</label>
+        <label class="check" title="When on, flagged outliers count in n, mean, std dev, min/max, in-spec % and Cpk. When off, the statistics describe the non-flagged points only. Only applies in Flag mode."><input type="checkbox" id="fStatsOut"> Include outliers in stats</label>
+        <div class="readout" id="chanReadout"><span class="ro-label">Channel</span><span class="ro-value" id="fChanValue">&mdash;</span></div>
+        <div class="readout" id="elemReadout"><span class="ro-label">Element</span><span class="ro-value" id="fElemValue">&mdash;</span></div>
+        <span class="muted small" id="filterCount"></span>
+      </div>
+
+      <div id="singleView" class="single">
+        <div class="single-nav">
+          <button class="btn" id="prevBtn" title="Previous (Left arrow)">&#9664; Prev</button>
+          <div class="single-pos"><span id="posLabel"></span><div class="muted small" id="posCaption"></div></div>
+          <button class="btn" id="nextBtn" title="Next (Right arrow)">Next &#9654;</button>
+          <button class="btn btn-secondary" id="downloadBtn">Download PNG</button>
+        </div>
+        <div class="canvas-wrap" id="canvasWrap">
+          <canvas id="mainCanvas"></canvas>
+          <div class="tooltip" id="tooltip" hidden></div>
+        </div>
+        <div class="muted small">Use Left / Right arrow keys to move between charts, Home / End to jump. Hover a point for details.</div>
+      </div>
+
+      <div id="libraryView" class="library" hidden>
+        <div class="grid" id="libraryGrid"></div>
+      </div>
+    </div>
+
+    <div class="modal" id="zipModal" hidden>
+      <div class="modal-box">
+        <h3 id="zipTitle">Preparing zip</h3>
+        <div class="bar"><div class="fill" id="zipFill"></div></div>
+        <div class="muted small" id="zipLabel"></div>
+        <button class="btn btn-secondary" id="zipCancel">Cancel</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/parse-core.js"></script>
+<script src="js/jet-core.js"></script>
+<script src="js/ticks.js"></script>
+<script src="js/model.js"></script>
+<script src="js/chart.js"></script>
+<script src="js/zip.js"></script>
+<script src="js/loader.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

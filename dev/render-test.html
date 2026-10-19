@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>render test</title>
+<style>body{margin:0;background:#fff;font-family:sans-serif} canvas{display:block;border:1px solid #ccc;margin:4px} #log{white-space:pre;font:12px monospace;padding:6px}</style>
+</head>
+<body>
+<div id="log"></div>
+<script src="../js/parse-core.js"></script>
+<script src="../js/ticks.js"></script>
+<script src="../js/model.js"></script>
+<script src="../js/chart.js"></script>
+<script src="../js/zip.js"></script>
+<script src="../js/loader.js"></script>
+<script src="sample-data.js"></script>
+<script>
+(function () {
+  var log = function (s) { console.log('LOG ' + s); document.getElementById('log').textContent += s + '\n'; };
+  log('script start; sample machines: ' + Object.keys(window.SAMPLE_CSV || {}).join(','));
+  window.addEventListener('error', function (e) { log('WINDOW ERROR ' + e.message + ' @' + e.filename + ':' + e.lineno); });
+  var T = CATE.ticks, model = CATE.model;
+  var loader = new CATE.Loader(model); if (/nowork/.test(location.search)) loader.workersBlocked = true;
+  var pending = 0;
+  loader.on('slot', function (s) { if (s.status === 'error') log('ERROR ' + s.name + ': ' + s.error); });
+  loader.on('dataChanged', function (d) {
+    if (d.removed) return;
+    var s = loader.slots[d.machine];
+    log(s.name + ': ' + s.rowsKept + ' rows, ' + s.stats.encoding + ', worker=' + (loader.workersBlocked ? 'no' : 'yes'));
+    if (--pending === 0) run();
+  });
+  Object.keys(window.SAMPLE_CSV).forEach(function (name) {
+    pending++;
+    var f = new File([window.SAMPLE_CSV[name]], name + '.csv', { type: 'text/csv' });
+    loader.addFiles([f]);
+  });
+  function run() {
+    var settings = { start: T.parseIsoDate('2026-09-26'), end: T.parseIsoDate('2026-10-01'),
+      overrides: [{ coil: '1.5T GEM PA', start: T.parseIsoDate('2026-01-01'), end: T.todayUtc() }] };
+    var build = model.build(settings);
+    log('build: ' + build.totalCharts + ' charts');
+    var targets = [
+      ['1.5T GEM PA', 'Mode_ALL', 'TC01_Ch14_EL1.png'],
+      ['1.5T GEM HNU', 'Mode_3C', 'TC01_Ch29_E7.png'],
+      ['3T Kizuna Breast Coil', 'Mode_FULL', 'TC06_Ch3_EE3_RF.png']
+    ];
+    targets.forEach(function (t) {
+      var coil = build.coils.filter(function (c) { return c.name === t[0]; })[0];
+      if (!coil) { log('no coil ' + t[0]); return; }
+      var g = coil.groups.filter(function (g) { return g.modeDir === t[1] && g.fileName === t[2]; })[0];
+      if (!g) { log('no group ' + t.join('/')); return; }
+      var spec = model.chartSpec(coil, g);
+      log(t.join('/') + ': ' + spec.series.map(function (s) { return s.label; }).join(' | ') + ' | ' + spec.lsl.concat(spec.usl).map(function (l) { return l.label; }).join(' | ') + (spec.missingSpec ? ' | N/A' : ''));
+      var cv = document.createElement('canvas');
+      document.body.appendChild(cv);
+      CATE.chart.render(cv, spec, { cssWidth: 1950, dpr: 1, watermark: t[0] === '1.5T GEM HNU' ? 'PARTIAL DATA — files still loading' : null });
+    });
+    // outlier flag mode + statistics panel on the GEM PA chart
+    (function () {
+      var coil = build.coils.filter(function (c) { return c.name === '1.5T GEM PA'; })[0];
+      var g = coil && coil.groups.filter(function (g) { return g.modeDir === 'Mode_ALL' && g.fileName === 'TC01_Ch14_EL1.png'; })[0];
+      if (!g) return;
+      ['flag', 'exclude'].forEach(function (mode) {
+        var spec = model.chartSpec(coil, g, -1, { outlierMode: mode, k: 3.5, stats: true });
+        log(mode + ': outliers ' + (spec.outliers ? spec.outliers.count + ' (' + spec.outliers.nPinned + ' pinned)' : 'none') + ', y ' + spec.yMin.toFixed(2) + '..' + spec.yMax.toFixed(2) + ', height ' + CATE.chart.heightFor(spec));
+        var cv = document.createElement('canvas');
+        document.body.appendChild(cv);
+        CATE.chart.render(cv, spec, { cssWidth: 1950, dpr: 1 });
+      });
+    })();
+    // zip smoke test
+    var z = new CATE.ZipWriter(); z.add('a/b.txt', new TextEncoder().encode('hello')); log('zip bytes: ' + z.toBlob().size + ' crc(hello)=' + CATE.crc32(new TextEncoder().encode('hello')).toString(16));
+    document.title = 'render test done';
+  }
+})();
+</script>
+</body>
+</html>

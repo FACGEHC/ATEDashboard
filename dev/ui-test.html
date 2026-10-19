@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ui test</title>
+<style>html,body{margin:0;height:100%} iframe{border:0;width:100%;height:100%}</style>
+</head>
+<body>
+<iframe id="f" src="../CATEDASHBOARD.html"></iframe>
+<script src="sample-data.js"></script>
+<script>
+(function () {
+  var q = location.search;
+  var f = document.getElementById('f');
+  function onFrameLoad() {
+    var w = f.contentWindow, app = w.cateApp;
+    console.log('UI iframe loaded, app=' + !!app);
+    if (/nowork/.test(q)) app.loader.workersBlocked = true;
+    var list = window.SAMPLE_FILES || Object.keys(window.SAMPLE_CSV).map(function (name) { return { name: name + '.csv', text: window.SAMPLE_CSV[name] }; });
+    if (/sensonly/.test(q)) list = list.filter(function (x) { return !/Results\.csv$/i.test(x.name); });   // Sensitivity CSVs only
+    var files = list.map(function (x) { return new w.File([x.text], x.name, { type: 'text/csv' }); });
+    if (/partial/.test(q)) files = files.filter(function (x) { return x.name !== 'CATE1001.csv'; });          // leave CATE1001 Sensitivity out
+    if (/nosample/.test(q)) files = [];                                                                       // nosample: start empty (combine with mdb=)
+    app.loadFiles(files);
+    if (/watch/.test(q)) {   // log loader state once a second (worker-path debugging)
+      var t0w = Date.now();
+      setInterval(function () {
+        console.log('watch +' + ((Date.now() - t0w) / 1000).toFixed(1) + 's ' + app.loader.slots.filter(function (s) { return s.status !== 'empty'; }).map(function (s) {
+          return s.name + ':' + s.status + ' ' + Math.round(s.progress * 100) + '% rows=' + s.rowsRead + ' tbl=' + (s.currentTable || '-') + ' ds=' + Object.keys(s.datasets).length + ' q=' + s.queue.length + ' pend=' + s.pending + ' fin=' + s.finishWhenIdle + ' w=' + !!s.worker; }).join(' | ') + ' busy=' + app.loader.isBusy() + ' build=' + !!app.state.build);
+      }, 1000);
+    }
+    // preset=all|last7|last30|ytd: click that date-range preset, then rebuild synchronously
+    function applyPreset() {
+      var pr = /preset=(\w+)/.exec(q);
+      if (!pr) return;
+      var btn = f.contentDocument.querySelector('[data-preset="' + pr[1] + '"]');
+      if (btn) { btn.click(); app.generate(); console.log('preset ' + pr[1] + ': ' + app.state.settings.start + '..' + app.state.settings.end + ', ' + (app.state.build ? app.state.build.totalCharts : '?') + ' charts'); }
+      else console.log('preset ' + pr[1] + ' not found');
+    }
+    var tries = 0;
+    (function waitBuild() {
+      if ((app.state.build || !files.length) && !app.loader.isBusy()) {   // nosample: nothing to build yet
+        console.log('UI build: ' + (app.state.build ? app.state.build.totalCharts : 'none') + ' charts');
+        var me = /[?&]meas=(\w+)/.exec(q);   // not thenmeas= / mdbmeas=
+        if (app.state.build) applyPreset();
+        if (me) { app.setMeasurement(me[1]); console.log('measurement ' + me[1] + ': ' + (app.state.build ? app.state.build.totalCharts : '?') + ' charts'); }
+        if (/coil/.test(q)) {
+          var cm = /coil=([^&]+)/.exec(q);
+          app.openCoil(cm ? decodeURIComponent(cm[1]) : '1.5T GEM HNU', false);
+          var om = /outliers=(\w+)/.exec(q), km = /k=([\d.]+)/.exec(q), sm = /stats=(\d)/.exec(q), xm = /statsout=(\d)/.exec(q);
+          if (om || km || sm || xm) app.setOutliers(om && om[1], km && km[1], sm ? sm[1] === '1' : undefined, xm ? xm[1] === '1' : undefined);
+          var ch = /chart=([^&]+)/.exec(q);
+          if (ch) { var parts = decodeURIComponent(ch[1]).split('/'); console.log('goTo ' + parts.join('/') + ' -> ' + app.goTo(parts[0], parts[1])); }
+          var mm = /machine=((?:CATE|EVO|NATE)\d+)/.exec(q);
+          if (mm) { var sel = f.contentDocument.getElementById('fMachine'); sel.value = mm[1]; sel.dispatchEvent(new w.Event('change')); }
+          if (/lib/.test(q)) app.setViewMode('library');
+          if (/partial/.test(q)) {
+            // now start CATE1001 to show the partial banner while it loads
+            app.loader.workersBlocked = true;
+            app.loadFiles([new w.File([window.SAMPLE_CSV.CATE1001], 'CATE1001.csv')]);
+          }
+        }
+        var tm = /thenmeas=(\w+)/.exec(q);   // thenmeas=Noise: pick a measurement from the viewer dropdown after the coil opened (tests the "none for this coil" guard)
+        if (tm) { app.setMeasurement(tm[1]); var mn = f.contentDocument.getElementById('measureNote'); console.log('thenmeas ' + tm[1] + ' -> select now ' + f.contentDocument.getElementById('fMeasure').value + ', viewer hidden ' + f.contentDocument.getElementById('viewer').hidden + ', note: ' + (mn.hidden ? '(hidden)' : mn.textContent)); }
+        var cc = /covchip=([^&]+)/.exec(q);   // covchip=CATE1006/MCBias: click that data-type chip in the Data coverage table
+        if (cc) { var cp = decodeURIComponent(cc[1]).split('/'); var hit = null; Array.prototype.forEach.call(f.contentDocument.querySelectorAll('#coverage tbody tr'), function (r) { if (r.firstChild.textContent !== cp[0]) return; Array.prototype.forEach.call(r.querySelectorAll('.chip'), function (b) { if (b.textContent.indexOf(cp[1]) === 0) hit = b; }); }); if (hit) hit.click(); console.log('covchip ' + cp.join('/') + ' -> ' + (hit ? 'clicked, measurement now ' + app.state.settings.measurement + ', machine ' + app.state.coverageMachine : 'not found')); }
+        var cv = /covsel=(\w+)/.exec(q);   // covsel=NATE1001: click that machine in the overview's Data coverage table
+        if (cv) { var crows = f.contentDocument.querySelectorAll('#coverage tbody tr'); Array.prototype.forEach.call(crows, function (r) { if (r.firstChild.textContent === cv[1]) r.click(); }); }
+        var co = /covopen=([^&]+)/.exec(q);   // covopen=<coil>: click that coil's link in Charts by coil (after covsel)
+        if (co) { var links = f.contentDocument.querySelectorAll('#chartSummary a'); Array.prototype.forEach.call(links, function (a) { if (a.textContent === decodeURIComponent(co[1])) a.click(); }); console.log('covopen -> machine filter ' + f.contentDocument.getElementById('fMachine').value + ', viewer hidden ' + f.contentDocument.getElementById('viewer').hidden); }
+        var ps = /pinslot=(\w+)/.exec(q);   // pinslot=NATE1001: keep that machine's file details open (hover state) for the screenshot
+        if (ps) { var rows = f.contentDocument.querySelectorAll('#fileTable tbody tr'); Array.prototype.forEach.call(rows, function (r) { if (r.textContent.indexOf(ps[1]) === 0) r.classList.add('pinned'); }); }
+        if (/overrides/.test(q)) {   // open the per-coil overrides box and show the coil list
+          var box = f.contentDocument.getElementById('overridesBox'); box.open = true;
+          var sel = f.contentDocument.getElementById('ovCoil');
+          console.log('override coils: ' + Array.from(sel.options).map(function (o) { return o.value || '(placeholder: ' + o.text + ')'; }).join(' | '));
+          if (/ovshow/.test(q)) sel.size = sel.options.length;   // expand so the screenshot shows every entry
+        }
+        setTimeout(function () {
+          var hv = /hover=([^&]+)/.exec(q);   // hover=outlier:N (Nth pinned outlier by x) or hover=X,Y (canvas CSS px)
+          if (hv) {
+            var sp = app.state.currentSpec, ri = app.state.renderInfo, cx, cy;
+            var om2 = /^outlier:(\d+)$/.exec(hv[1]);
+            if (om2 && sp && sp.outliers) {
+              var pins = sp.outliers.items.filter(function (o) { return o.flag === 1 || o.flag === 2; });
+              pins.sort(function (a, b) { return sp.series[a.s].xs[a.i] - sp.series[b.s].xs[b.i]; });
+              var it = pins.length ? pins[Math.min(+om2[1], pins.length - 1)] : { s: 0, i: 0 };   // no pinned outlier: first point
+              var ser = sp.series[it.s];
+              cx = ri.L.sx(ser.xs[it.i]) * ri.cssScale; cy = ri.L.ptY(ser, it.i) * ri.cssScale;
+            } else { var xy = hv[1].split(','); cx = +xy[0]; cy = +xy[1]; }
+            var hit = app.hoverAt(cx, cy);
+            var tipEl = f.contentDocument.getElementById('tooltip');
+            console.log('hover at ' + cx.toFixed(0) + ',' + cy.toFixed(0) + ' -> ' + (hit ? 'hit ' + hit.series.machine + ' stacked ' + hit.stackedTotal : 'none') + ' tip left=' + tipEl.style.left + ' top=' + tipEl.style.top + ' w=' + tipEl.offsetWidth);
+          }
+          if (app.state.currentSpec && app.state.currentSpec.labelStats) console.log('labels drawn=' + app.state.currentSpec.labelStats.drawn + ' skipped=' + app.state.currentSpec.labelStats.skipped);
+          console.log('UI ready'); document.title = 'ui ready';
+          // mdb=<file:// url>: fetch a real Access database and drop it through the normal loader (worker path)
+          var mdb = /mdb=([^&]+)/.exec(q);
+          if (mdb) {
+            var url = decodeURIComponent(mdb[1]), tFetch = Date.now();
+            fetch(url).then(function (r) { return r.blob(); }).then(function (blob) {
+              var name = url.split('/').pop();
+              console.log('fetched ' + name + ' ' + blob.size + ' bytes in ' + (Date.now() - tFetch) + ' ms');
+              var tLoad = Date.now(), lastLog = 0;
+              app.loadFiles([new w.File([blob], name)]);
+              (function poll() {
+                var m = app.loader.slots.filter(function (s) { return s.status !== 'empty'; });
+                var busy = app.loader.isBusy();
+                var now = Date.now();
+                if (now - lastLog > 5000) { lastLog = now; console.log('mdb progress: ' + m.map(function (s) { return s.name + ' ' + s.status + ' ' + Math.round(s.progress * 100) + '% ' + (s.currentTable || '') + ' datasets=' + Object.keys(s.datasets).join('/'); }).join(' | ')); }
+                if (busy || !app.state.build) { setTimeout(poll, 250); return; }
+                setTimeout(function () {
+                  var s = app.loader.slots[w.CATE.machineIndexFromName(name)];
+                  console.log('MDB loaded in ' + (Date.now() - tLoad) + ' ms: status ' + s.status + ', datasets ' + Object.keys(s.datasets).map(function (k) { return k + '=' + s.datasets[k].rowsKept; }).join(', ') + ', errors ' + JSON.stringify(s.tableErrors) + ', build ' + app.state.build.totalCharts + ' charts (' + app.state.build.measurement + ')');
+                  // mdbcoil=<coil>[&mdbmeas=<measurement>][&mdbchart=<mode>/<key>]: open a chart of the loaded data before the screenshot
+                  var mc = /mdbcoil=([^&]+)/.exec(q), mme = /mdbmeas=([^&]+)/.exec(q), mch = /mdbchart=([^&]+)/.exec(q);
+                  if (mme) app.setMeasurement(mme[1]);
+                  applyPreset();
+                  if (mc) { app.openCoil(decodeURIComponent(mc[1]), false); if (/stats=1/.test(q)) app.setOutliers(undefined, undefined, true, undefined); }
+                  if (mch) { var mp = decodeURIComponent(mch[1]).split('/'); console.log('goTo ' + mp.join('/') + ' -> ' + app.goTo(mp[0], mp[1])); }
+                  // mdbcov=<machine>: click that machine's row in the Data coverage table (filters Charts by coil)
+                  var mcv = /mdbcov=([^&]+)/.exec(q);
+                  if (mcv) { var rows = Array.prototype.slice.call(w.document.querySelectorAll('#coverage tr.selectable')).filter(function (r) { return r.cells[0].textContent === mcv[1]; }); console.log('coverage row ' + mcv[1] + ' -> ' + (rows.length ? 'clicked' : 'not found')); if (rows.length) rows[0].click(); }
+                  if (mc) { setTimeout(function () { document.title = 'mdb ready'; }, 600); return; }
+                  document.title = 'mdb ready';
+                }, 500);
+              })();
+            }).catch(function (e) { console.log('mdb fetch failed: ' + e); });
+          }
+        }, 300);
+        return;
+      }
+      if (++tries > 400) { console.log('UI timeout'); return; }
+      setTimeout(waitBuild, 50);
+    })();
+  }
+  // sample-data.js can take longer to parse than the iframe takes to load: attach or run immediately
+  if (f.contentWindow && f.contentWindow.cateApp) onFrameLoad(); else f.addEventListener('load', onFrameLoad);
+})();
+</script>
+</body>
+</html>

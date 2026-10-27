@@ -90,6 +90,7 @@
     var cols = parsed.columns;
     var n = parsed.n;
     if (!cols.port) { cols.port = new Int32Array(n); cols.port.fill(-1); }
+    if (!cols.pf) { cols.pf = new Int8Array(n); cols.pf.fill(-1); }          // datasets parsed before the PassFail column existed
     ['coil', 'mode', 'chan', 'elem', 'net', 'sn', 'units', 'port'].forEach(function (d) {
       var local = parsed.dicts[d] || [];
       var map = new Int32Array(local.length);
@@ -106,7 +107,7 @@
       keyKind: parsed.keyKind || CATE.MEASUREMENTS[measurement].keyKind, n: n,
       time: cols.time, meas: cols.meas, lsl: cols.lsl, usl: cols.usl, tc: cols.tc,
       coil: cols.coil, mode: cols.mode, chan: cols.chan, elem: cols.elem, net: cols.net, sn: cols.sn, units: cols.units, port: cols.port,
-      extras: cols.extras || {},
+      pf: cols.pf, extras: cols.extras || {},
       stats: parsed.stats, rowsByCoil: null
     };
     ds.rowsByCoil = buildRowsByCoil(ds, this.dict.coil.list.length);
@@ -142,6 +143,16 @@
   Model.prototype.measurementsLoaded = function () {
     var self = this;
     return CATE.MEASUREMENT_ORDER.filter(function (k) { return self.datasetsFor(k).length > 0; });
+  };
+  /* Time extent of one machine's loaded data, or null when nothing is loaded for it. */
+  Model.prototype.machineExtent = function (m) {
+    var mach = this.machines[m], mn = Infinity, mx = -Infinity;
+    if (!mach) return null;
+    Object.keys(mach.datasets).forEach(function (k) {
+      var st = mach.datasets[k].stats;
+      if (st && !isNaN(st.tMin)) { mn = Math.min(mn, st.tMin); mx = Math.max(mx, st.tMax); }
+    });
+    return mn === Infinity ? null : { tMin: mn, tMax: mx };
   };
   /* Time extent of the loaded data (one measurement, or everything). */
   Model.prototype.extent = function (measurement) {
@@ -410,12 +421,14 @@
   CATE.robustScale = robustScale;
   CATE.detectOutliers = detectOutliers;
   CATE.describe = describe;
+  CATE.rowVerdict = rowVerdict;
 
   function fmtD(v, d) { return (v < 0 ? '−' : '') + Math.abs(v).toFixed(d); }
 
   /* Chart spec for the renderer (pure data).
    * onlyMachine (optional, 0..MACHINES.length-1): draw just that machine's series.
-   * opts: { outlierMode: 'flag'|'exclude'|'off', k, stats, statsOutliers: 'include'|'exclude', port: 'N' (only that port's rows) }
+   * opts: { outlierMode: 'flag'|'exclude'|'off', k, stats, statsOutliers: 'include'|'exclude', port: 'N' (only that port's rows),
+   *         runs: 'all'|'latest'|'first' (every row, or only each coil's latest / first test of this measurement) }
    *   (default: off, no stats; statsOutliers defaults to 'include' and only matters in flag mode,
    *    since exclude mode removes the points and off mode never flags any)
    */
@@ -428,11 +441,13 @@
     var MEAS = CATE.MEASUREMENTS[measurement];
     var dec = MEAS.decimals, units = g.units || MEAS.defaultUnits;
     var fmt2 = function (v) { return fmtD(v, dec); };
-    var self = this;
+    var self = this, NM = CATE.MACHINES.length;
     var series = [];
     var filtered = typeof onlyMachine === 'number' && onlyMachine >= 0;
     function dsOf(m) { var mach = self.machines[m]; return mach ? mach.datasets[measurement] : null; }
     var portId = opts.port ? self.dict.port.map.get(String(opts.port)) : undefined;
+    var runsMode = opts.runs === 'latest' || opts.runs === 'first' ? opts.runs : 'all';
+    var rowsFor = emptyPerMachine(null);                   // rows to draw per machine, after the machine and port filters
     for (var m = 0; m < CATE.MACHINES.length; m++) {
       var rows = g.rows[m];
       if (!rows) continue;
@@ -446,11 +461,41 @@
         if (!kept.length) continue;
         rows = Uint32Array.from(kept);
       }
-      var xs = new Float64Array(rows.length), ys = new Float64Array(rows.length);
-      for (var i = 0; i < rows.length; i++) { xs[i] = ds.time[rows[i]]; ys[i] = ds.meas[rows[i]]; }
-      var name = CATE.MACHINES[m], st = CATE.MACHINE_STYLE[name];
-      series.push({ machine: name, m: m, nCoils: g.nCoils[m], label: '',
-                    color: st.color, shape: st.shape, big: st.big, xs: xs, ys: ys, rows: rows, flags: null, nOut: 0 });
+      rowsFor[m] = rows;
+    }
+    // Latest / first run per coil: of every serial number keep only the row(s) at its latest (first) test
+    // date across the machines drawn, so a coil retested after a failure shows one point. Within one
+    // chart each test is measured once per run, so that row is the coil's latest (first) run of this test.
+    // Rows without a serial number are kept.
+    var runsCoils = 0;
+    if (runsMode !== 'all') {
+      var best = new Map();
+      for (var mb = 0; mb < NM; mb++) {
+        var rb = rowsFor[mb]; if (!rb) continue;
+        var dsb = dsOf(mb);
+        for (var ib = 0; ib < rb.length; ib++) {
+          var sb = dsb.sn[rb[ib]]; if (sb < 0) continue;
+          var scb = self.snClean[sb], tb = dsb.time[rb[ib]], curB = best.get(scb);
+          if (curB === undefined || (runsMode === 'latest' ? tb > curB : tb < curB)) best.set(scb, tb);
+        }
+      }
+      runsCoils = best.size;
+      for (var mk = 0; mk < NM; mk++) {
+        var rk = rowsFor[mk]; if (!rk) continue;
+        var dsk = dsOf(mk), keep = [];
+        for (var ik = 0; ik < rk.length; ik++) { var sk = dsk.sn[rk[ik]]; if (sk < 0 || dsk.time[rk[ik]] === best.get(self.snClean[sk])) keep.push(rk[ik]); }
+        rowsFor[mk] = keep.length ? Uint32Array.from(keep) : null;
+      }
+    }
+    for (var ms = 0; ms < NM; ms++) {
+      var rs = rowsFor[ms];
+      if (!rs) continue;
+      var dss = dsOf(ms);
+      var xs = new Float64Array(rs.length), ys = new Float64Array(rs.length), snSet = new Set();
+      for (var i = 0; i < rs.length; i++) { xs[i] = dss.time[rs[i]]; ys[i] = dss.meas[rs[i]]; var sni = dss.sn[rs[i]]; if (sni >= 0) snSet.add(self.snClean[sni]); }
+      var name = CATE.MACHINES[ms], st = CATE.MACHINE_STYLE[name];
+      series.push({ machine: name, m: ms, nCoils: runsMode === 'all' ? g.nCoils[ms] : snSet.size, label: '',
+                    color: st.color, shape: st.shape, big: st.big, xs: xs, ys: ys, rows: rs, flags: null, nOut: 0 });
     }
 
     // --- outlier detection over all drawn points
@@ -569,6 +614,7 @@
       } else {
         foot.push('All points included (outlier detection off).');
       }
+      if (runsMode !== 'all') foot.push((runsMode === 'latest' ? 'Latest' : 'First') + ' run per coil only: ' + runsCoils + ' coil' + (runsCoils === 1 ? '' : 's') + ', one point each (rows without a serial number kept).');
       var specTxt = [];
       if (hasL) specTxt.push('LSL ' + fmt2(lslT) + (g.lslSpans.length > 1 ? ' (latest of ' + g.lslSpans.length + ' revisions)' : ''));
       if (hasU) specTxt.push('USL ' + fmt2(uslT) + (g.uslSpans.length > 1 ? ' (latest of ' + g.uslSpans.length + ' revisions)' : ''));
@@ -591,6 +637,7 @@
       title2 += ' - Single ' + machineFamily(CATE.MACHINES[only]);
     }
     if (opts.port) title2 += ' · Port ' + opts.port;
+    if (runsMode !== 'all') { title2 += ' · ' + runsMode + ' run per coil'; fileName = fileName.replace(/\.png$/, '') + '_' + runsMode + '.png'; }
     return {
       title1: coilResult.name + ' - Mode ' + g.mode, title2: title2,
       series: series,
@@ -602,7 +649,7 @@
       fileName: fileName, relPath: coilResult.safeName + '/' + g.modeDir + '/' + fileName,
       machine: filtered ? CATE.MACHINES[onlyMachine] : null,
       measurement: measurement, units: units, decimals: dec, yLabel: MEAS.valueLabel || (MEAS.label + ' / Measurement (' + units + ')'),
-      port: opts.port || null,
+      port: opts.port || null, runs: runsMode, runsCoils: runsCoils,
       outlierMode: mode, outliers: outliers, stats: stats, statsOutliers: statsOut,
       excludedNote: (mode === 'exclude' && outliers && outliers.count) ? outliers.count + ' outlier' + (outliers.count === 1 ? '' : 's') + ' excluded (modified z-score, k = ' + k + ')' : null
     };
@@ -621,8 +668,214 @@
       lsl: ds.lsl[idx], usl: ds.usl[idx],
       units: ds.units[idx] >= 0 ? this.dict.units.list[ds.units[idx]] : CATE.MEASUREMENTS[measurement].defaultUnits,
       port: ds.port && ds.port[idx] >= 0 ? this.dict.port.list[ds.port[idx]] : '',
+      pf: ds.pf ? ds.pf[idx] : -1,                       // 1 PASS, 0 FAIL, -1 not recorded
       extras: extras
     };
+  };
+
+  /* ---------- test runs and first pass yield ----------
+   * A run is one pass of a tester over one coil (serial number): its rows across every loaded result
+   * table, in time order. A new run starts when the gap to the previous row exceeds gapMs, or when a
+   * measurement key (table, mode, test case, channel, element / net) repeats at a later time, i.e. the
+   * tester has started the sequence again. Rows that share a timestamp always belong to one run. The
+   * verdict of a row is its PassFail column, or its own LSL / USL when that column is missing; a run
+   * fails when any row fails, passes when at least one row is judged and none fails, else it is unjudged.
+   * Rows without a serial number cannot be attributed to a coil and are left out. */
+  CATE.RUN_GAP_MINUTES = 15;
+  function rowVerdict(ds, idx) {
+    var pf = ds.pf ? ds.pf[idx] : -1;
+    if (pf >= 0) return pf;
+    var y = ds.meas[idx], l = ds.lsl[idx], u = ds.usl[idx];
+    if (l !== l && u !== u) return -1;
+    return ((l === l && y < l) || (u === u && y > u)) ? 0 : 1;
+  }
+  Model.prototype.runs = function (gapMs) {
+    gapMs = gapMs > 0 ? gapMs : CATE.RUN_GAP_MINUTES * 60000;
+    if (this._runs && this._runs.version === this.version && this._runs.gapMs === gapMs) return this._runs;
+    var self = this, nCoils = this.dict.coil.list.length;
+    var dsList = [];                                       // every loaded dataset: { m, k, mi (MEASUREMENT_ORDER index), ds }
+    this.loadedMachines().forEach(function (mach) {
+      CATE.MEASUREMENT_ORDER.forEach(function (k, mi) { if (mach.datasets[k]) dsList.push({ m: mach.index, k: k, mi: mi, ds: mach.datasets[k] }); });
+    });
+    var coils = new Array(nCoils);
+    for (var c = 0; c < nCoils; c++) {
+      var n = 0;
+      dsList.forEach(function (e) { var r = e.ds.rowsByCoil[c]; if (r) n += r.length; });
+      var time = new Float64Array(n), src = new Uint16Array(n), row = new Uint32Array(n), sc = new Int32Array(n), p = 0;
+      dsList.forEach(function (e, di) {
+        var r = e.ds.rowsByCoil[c]; if (!r) return;
+        var ds = e.ds;
+        for (var i = 0; i < r.length; i++) {
+          var idx = r[i], s = ds.sn[idx];
+          if (s < 0) continue;
+          time[p] = ds.time[idx]; src[p] = di; row[p] = idx; sc[p] = self.snClean[s]; p++;
+        }
+      });
+      n = p;
+      var order = new Uint32Array(n);
+      for (var i0 = 0; i0 < n; i0++) order[i0] = i0;
+      order.sort(function (a, b) { return sc[a] - sc[b] || time[a] - time[b]; });
+      var runs = [], cur = null, keys = null, prevT = 0;
+      for (var q = 0; q < n; q++) {
+        var o = order[q], e = dsList[src[o]], ds2 = e.ds, idx2 = row[o], t = time[o];
+        var key = e.mi + '|' + ds2.mode[idx2] + '|' + ds2.tc[idx2] + '|' + ds2.chan[idx2] + '|' + ds2.elem[idx2] + '|' + ds2.net[idx2];
+        if (!cur || cur.sc !== sc[o] || t - prevT > gapMs || (t > prevT && keys.has(key))) {
+          cur = { sc: sc[o], sn: ds2.sn[idx2], m: e.m, t0: t, t1: t, start: q, end: q, n: 0, verdict: -1, failMask: 0, judgedMask: 0, machineMask: 0 };
+          runs.push(cur); keys = new Set();
+        }
+        keys.add(key);
+        cur.t1 = t; cur.end = q + 1; cur.n++; cur.machineMask |= (1 << e.m);
+        var v = rowVerdict(ds2, idx2);
+        if (v >= 0) { cur.judgedMask |= (1 << e.mi); if (v === 0) { cur.failMask |= (1 << e.mi); cur.verdict = 0; } else if (cur.verdict < 0) cur.verdict = 1; }
+        prevT = t;
+      }
+      coils[c] = { runs: runs, order: order, src: src, row: row, time: time, n: n };
+    }
+    this._runs = { version: this.version, gapMs: gapMs, dsList: dsList, coils: coils };
+    return this._runs;
+  };
+
+  /* First pass yield per coil type.
+   * settings: as build() (date range + per-coil overrides);
+   * opts: { gapMs, machine (0..n-1, or -1 for every machine), includeTestKits,
+   *         excludeSn: raw serial numbers whose runs are left out, as an array / Set of strings (case-insensitive), a RegExp or a predicate }
+   * A serial number counts as tested when its first run (over every loaded date, on the chosen machines)
+   * starts inside the coil's date range. It passed first time when that run passed; its final result is
+   * its latest run. Rates use the serials whose first run was judged (pass or fail). */
+  CATE.TEST_KIT_PATTERN = /test kit/i;
+  /* Production serial numbers as the testers record them: up to five digits (zero-padded on the CATE testers),
+   * optionally followed by a dash and a numeric suffix, e.g. 00827-301424423. Anything else (eval / test / engineering
+   * labels, names, mistyped entries) is a dummy serial, left out of the yield by default. */
+  CATE.SERIAL_FORMAT = /^\d{1,5}(-\d+)?$/;
+  CATE.SERIAL_DUMMY = /test|tst|eval/i;
+  CATE.isDummySerial = function (sn) { return CATE.SERIAL_DUMMY.test(sn) || !CATE.SERIAL_FORMAT.test(sn); };
+  function serialPredicate(spec) {
+    if (!spec) return null;
+    if (typeof spec === 'function') return spec;
+    if (spec instanceof RegExp) return function (sn) { return spec.test(sn); };
+    var set = new Set();
+    (spec instanceof Set ? Array.from(spec) : spec).forEach(function (sn) { set.add(String(sn).toLowerCase()); });
+    return set.size ? function (sn) { return set.has(sn.toLowerCase()); } : null;
+  }
+  CATE.serialPredicate = serialPredicate;
+
+  /* Every raw serial number in the loaded data (as the tester recorded it) with how often it was run, for the
+   * exclusion picker: [{ sn, variants, cleaned, dummy, runs, failed, coils (number of coil types), coilNames (up to three) }].
+   * Serials that differ only by case (TST / tst) are one entry, shown as the most-run spelling with the others in
+   * `variants`. Dummy serials (CATE.isDummySerial) come first in alphabetical order, then production serials by number. */
+  Model.prototype.serialList = function (gapMs) {
+    var R = this.runs(gapMs), names = this.dict.coil.list, rawList = this.dict.sn.list, cleanList = this.snCleanDict.list;
+    var by = new Map();
+    R.coils.forEach(function (rc, c) {
+      if (!rc) return;
+      rc.runs.forEach(function (r) {
+        var sn = rawList[r.sn], key = sn.toLowerCase(), e = by.get(key);
+        if (!e) by.set(key, e = { runs: 0, failed: 0, coilIds: new Set(), forms: new Map(), cleaned: cleanList[r.sc] });
+        e.runs++; if (r.verdict === 0) e.failed++; e.coilIds.add(c); e.forms.set(sn, (e.forms.get(sn) || 0) + 1);
+      });
+    });
+    var out = Array.from(by.values()).map(function (e) {
+      var ids = Array.from(e.coilIds);
+      var forms = Array.from(e.forms.entries()).sort(function (a, b) { return b[1] - a[1] || cmpStr(a[0], b[0]); }).map(function (f) { return f[0]; });
+      return { sn: forms[0], variants: forms.slice(1), cleaned: e.cleaned, dummy: CATE.isDummySerial(forms[0]), runs: e.runs, failed: e.failed,
+               coils: ids.length, coilNames: ids.slice(0, 3).map(function (c) { return names[c]; }) };
+    });
+    out.sort(function (a, b) {
+      if (a.dummy !== b.dummy) return a.dummy ? -1 : 1;
+      if (!a.dummy) return (parseInt(a.cleaned, 10) - parseInt(b.cleaned, 10)) || cmpStr(a.sn, b.sn);
+      return cmpStr(a.sn.toLowerCase(), b.sn.toLowerCase()) || cmpStr(a.sn, b.sn);
+    });
+    return out;
+  };
+
+  Model.prototype.yieldReport = function (settings, opts) {
+    opts = opts || {};
+    var R = this.runs(opts.gapMs), self = this, dict = this.dict;
+    var onlyM = typeof opts.machine === 'number' && opts.machine >= 0 ? opts.machine : -1;
+    var excluded = serialPredicate(opts.excludeSn);
+    var ORDER = CATE.MEASUREMENT_ORDER, NMEAS = ORDER.length;
+    function newAgg(name) {
+      return { coil: name, tested: 0, judged: 0, firstPass: 0, firstFail: 0, unjudged: 0, retested: 0, finalPass: 0, runs: 0, runsFailed: 0, excluded: 0,
+               byMeas: ORDER.map(function (k) { return { measurement: k, label: CATE.MEASUREMENTS[k].label, judged: 0, failed: 0 }; }),
+               byMachine: CATE.MACHINES.map(function (nm) { return { machine: nm, tested: 0, pass: 0, fail: 0 }; }),
+               failTests: new Map(), fpyPct: NaN, finalPct: NaN };
+    }
+    function rates(a) {
+      a.judged = a.firstPass + a.firstFail;
+      a.fpyPct = a.judged ? a.firstPass / a.judged * 100 : NaN;
+      a.finalPct = a.judged ? a.finalPass / a.judged * 100 : NaN;
+      a.byMeas = a.byMeas.filter(function (x) { return x.judged > 0; });
+      a.byMachine = a.byMachine.filter(function (x) { return x.tested > 0; });
+      a.failTests = Array.from(a.failTests.entries()).map(function (kv) { return { test: kv[0], coils: kv[1] }; })
+        .sort(function (x, y) { return y.coils - x.coils || cmpStr(x.test, y.test); });
+      return a;
+    }
+    function testLabel(e, ds, idx) {
+      var MEAS = CATE.MEASUREMENTS[e.k];
+      var head = MEAS.label + ' · Mode ' + dict.mode.list[ds.mode[idx]] + ' · ';
+      if (ds.keyKind === 'net') return head + (MEAS.keyLabel || 'Net') + ' ' + dict.net.list[ds.net[idx]];
+      return head + 'TC' + pad2(ds.tc[idx]) + ' Ch' + dict.chan.list[ds.chan[idx]] + ' E' + dict.elem.list[ds.elem[idx]];
+    }
+    var coils = [], tot = newAgg('All coil types'), skippedKits = 0;
+    this.coilList().forEach(function (ce) {
+      if (!opts.includeTestKits && CATE.TEST_KIT_PATTERN.test(ce.name)) { skippedKits++; return; }
+      var rc = R.coils[ce.id];
+      if (!rc || !rc.runs.length) return;
+      var range = rangeForCoil(settings, ce.name);
+      var bySn = new Map();
+      rc.runs.forEach(function (r) {
+        if (onlyM >= 0 && r.m !== onlyM) return;
+        var l = bySn.get(r.sc); if (!l) bySn.set(r.sc, l = []);
+        l.push(r);                                         // time order within a serial (runs were built that way)
+      });
+      var agg = newAgg(ce.name), exclKeys = new Set();          // excluded serials, counted case-insensitively (TST and tst are one)
+      agg.coilId = ce.id; agg.start = range.start; agg.endIncl = range.endIncl; agg.override = range.override;
+      bySn.forEach(function (list, sc) {
+        if (excluded) {                                      // runs recorded under an excluded raw serial drop out; the coil keeps its other runs
+          var kept = [];
+          list.forEach(function (r) {
+            var raw = dict.sn.list[r.sn];
+            if (!excluded(raw)) kept.push(r);
+            else if (r.t0 >= range.start && r.t0 < range.endExcl) exclKeys.add(raw.toLowerCase());
+          });
+          if (!kept.length) return;
+          list = kept;
+        }
+        var first = list[0], last = list[list.length - 1];
+        if (first.t0 < range.start || first.t0 >= range.endExcl) return;
+        agg.tested++; agg.runs += list.length;
+        list.forEach(function (r) { if (r.verdict === 0) agg.runsFailed++; });
+        if (list.length > 1) agg.retested++;
+        if (first.verdict === 1) agg.firstPass++; else if (first.verdict === 0) agg.firstFail++; else agg.unjudged++;
+        if (last.verdict === 1 && first.verdict >= 0) agg.finalPass++;
+        var bm = agg.byMachine[first.m]; bm.tested++; if (first.verdict === 1) bm.pass++; else if (first.verdict === 0) bm.fail++;
+        for (var mi = 0; mi < NMEAS; mi++) {
+          if (first.judgedMask & (1 << mi)) { agg.byMeas[mi].judged++; if (first.failMask & (1 << mi)) agg.byMeas[mi].failed++; }
+        }
+        if (first.verdict === 0) {                         // which tests failed on the first run
+          var seen = new Set();
+          for (var q = first.start; q < first.end; q++) {
+            var o = rc.order[q], e = R.dsList[rc.src[o]], idx = rc.row[o];
+            if (rowVerdict(e.ds, idx) !== 0) continue;
+            var label = testLabel(e, e.ds, idx);
+            if (seen.has(label)) continue;
+            seen.add(label);
+            agg.failTests.set(label, (agg.failTests.get(label) || 0) + 1);
+          }
+        }
+      });
+      agg.excluded = exclKeys.size;
+      tot.excluded += agg.excluded;                            // counted even when the coil type is not listed
+      if (!agg.tested) return;                                 // only dummy serials in range: no row
+      ['tested', 'firstPass', 'firstFail', 'unjudged', 'retested', 'finalPass', 'runs', 'runsFailed'].forEach(function (f) { tot[f] += agg[f]; });
+      agg.byMeas.forEach(function (x, mi) { tot.byMeas[mi].judged += x.judged; tot.byMeas[mi].failed += x.failed; });
+      agg.byMachine.forEach(function (x, m) { tot.byMachine[m].tested += x.tested; tot.byMachine[m].pass += x.pass; tot.byMachine[m].fail += x.fail; });
+      agg.failTests.forEach(function (cnt, label) { tot.failTests.set(agg.coil + ' · ' + label, cnt); });
+      coils.push(rates(agg));
+    });
+    coils.sort(function (a, b) { return b.tested - a.tested || cmpStr(a.coil, b.coil); });
+    return { coils: coils, total: rates(tot), skippedTestKits: skippedKits, gapMs: R.gapMs, machine: onlyM >= 0 ? CATE.MACHINES[onlyM] : null,
+             tables: this.measurementsLoaded().map(function (k) { return CATE.MEASUREMENTS[k].label; }), version: this.version };
   };
 
   /* Summaries (charts_generated_by_coil / by_coil_mode) */

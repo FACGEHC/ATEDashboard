@@ -13,6 +13,8 @@
     build: null,                 // result of model.build
     selectedCoil: null,          // coil name
     viewMode: 'single',
+    tab: 'charts',               // 'charts' (overview + viewer) or 'yield'
+    yieldOpen: {},               // coil types whose detail row is expanded in the Yield tab
     filters: { machine: '', mode: '', tc: '', net: '', port: '' },     // machine = '' (all) or 'CATE1001' etc.
     filtered: [],                // groups after filters
     index: 0,
@@ -24,11 +26,17 @@
   };
 
   /* ---------------- settings ---------------- */
+  function normSerials(list) {                                // lower-case, trimmed, unique, non-empty
+    var seen = new Set(), out = [];
+    list.forEach(function (v) { var k = String(v).trim().toLowerCase(); if (k && !seen.has(k)) { seen.add(k); out.push(k); } });
+    return out;
+  }
   function loadSettings() {
     var s = { start: CATE.DEFAULTS.start, end: CATE.DEFAULTS.end,
               overrides: CATE.DEFAULTS.overrides.map(function (o) { return { coil: o.coil, start: o.start, end: o.end }; }),
               outlierMode: CATE.OUTLIER_DEFAULTS.mode, outlierK: CATE.OUTLIER_DEFAULTS.k, stats: true, statsOutliers: true,
-              measurement: 'Sensitivity' };
+              measurement: 'Sensitivity', runs: 'all',
+              yieldGap: CATE.RUN_GAP_MINUTES, yieldExcludeRule: true, yieldExcludeOn: [], yieldExcludeOff: [], yieldTestKits: false, yieldMachine: '' };
     try {
       var raw = localStorage.getItem(STORAGE_KEY);
       if (raw) {
@@ -41,6 +49,13 @@
           if (typeof p.stats === 'boolean') s.stats = p.stats;
           if (typeof p.statsOutliers === 'boolean') s.statsOutliers = p.statsOutliers;
           if (CATE.MEASUREMENTS[p.measurement]) s.measurement = p.measurement;
+          if (['all', 'latest', 'first'].indexOf(p.runs) >= 0) s.runs = p.runs;
+          if (isFinite(+p.yieldGap) && +p.yieldGap >= 1 && +p.yieldGap <= 1440) s.yieldGap = +p.yieldGap;
+          if (typeof p.yieldExcludeRule === 'boolean') s.yieldExcludeRule = p.yieldExcludeRule;   // (an older `yieldExclude` regex / list is dropped: the rule covers it)
+          if (Array.isArray(p.yieldExcludeOn)) s.yieldExcludeOn = normSerials(p.yieldExcludeOn);
+          if (Array.isArray(p.yieldExcludeOff)) s.yieldExcludeOff = normSerials(p.yieldExcludeOff);
+          if (typeof p.yieldTestKits === 'boolean') s.yieldTestKits = p.yieldTestKits;
+          if (typeof p.yieldMachine === 'string' && (!p.yieldMachine || CATE.MACHINES.indexOf(p.yieldMachine) >= 0)) s.yieldMachine = p.yieldMachine;
         }
       }
     } catch (e) { /* ignore */ }
@@ -334,7 +349,7 @@
   /* ---------------- generate ---------------- */
   $('generateBtn').addEventListener('click', generate);
   function generate() {
-    if (!model.hasData()) { state.build = null; renderCoilList(); renderSummary(); renderStatus(); return; }
+    if (!model.hasData()) { state.build = null; renderCoilList(); renderSummary(); renderStatus(); if (state.tab === 'yield') renderYield(); return; }
     var rs = resolvedSettings();
     if (rs.error) { showRangeError(rs.error); return; }
     showRangeError('');
@@ -345,6 +360,7 @@
     renderSummary();
     renderStatus();
     if (state.selectedCoil) openCoil(state.selectedCoil, true);
+    if (state.tab === 'yield') renderYield();
   }
 
   $('coilSearch').addEventListener('input', renderCoilList);
@@ -486,11 +502,11 @@
   function machineIndex() { return state.filters.machine ? CATE.MACHINES.indexOf(state.filters.machine) : -1; }
   function chartOpts() {
     var s = state.settings;
-    return { outlierMode: s.outlierMode, k: s.outlierK, stats: s.stats, statsOutliers: s.statsOutliers ? 'include' : 'exclude', port: state.filters.port || null };
+    return { outlierMode: s.outlierMode, k: s.outlierK, stats: s.stats, statsOutliers: s.statsOutliers ? 'include' : 'exclude', port: state.filters.port || null, runs: s.runs || 'all' };
   }
   function specFor(coil, g) {
     var mi = machineIndex(), o = chartOpts();
-    var key = g.measurement + '#' + g.key + '#' + mi + '#' + o.outlierMode + '#' + o.k + '#' + (o.stats ? 1 : 0) + '#' + o.statsOutliers + '#' + (o.port || '');
+    var key = g.measurement + '#' + g.key + '#' + mi + '#' + o.outlierMode + '#' + o.k + '#' + (o.stats ? 1 : 0) + '#' + o.statsOutliers + '#' + (o.port || '') + '#' + o.runs;
     var s = state.specCache.get(key);
     if (!s) { s = model.chartSpec(coil, g, mi, o); state.specCache.set(key, s); }
     return s;
@@ -500,6 +516,7 @@
     $('fK').value = state.settings.outlierK;
     $('fStats').checked = !!state.settings.stats;
     $('fStatsOut').checked = !!state.settings.statsOutliers;
+    $('fRuns').value = state.settings.runs || 'all';
     // the toggle only has an effect in Flag mode (Exclude drops the points, Off never flags any)
     $('fStatsOut').disabled = state.settings.outlierMode !== 'flag' || !state.settings.stats;
   }
@@ -508,13 +525,14 @@
     if (!(k >= 1 && k <= 20)) { k = state.settings.outlierK; $('fK').value = k; }
     state.settings.outlierMode = mode; state.settings.outlierK = k; state.settings.stats = $('fStats').checked;
     state.settings.statsOutliers = $('fStatsOut').checked;
+    state.settings.runs = ['all', 'latest', 'first'].indexOf($('fRuns').value) >= 0 ? $('fRuns').value : 'all';
     $('fStatsOut').disabled = mode !== 'flag' || !state.settings.stats;
     saveSettings();
     state.specCache = new Map();
     if ($('viewer').hidden) return;
     if (state.viewMode === 'single') renderSingle(); else renderLibrary();
   }
-  ['fOutliers', 'fK', 'fStats', 'fStatsOut'].forEach(function (id) { $(id).addEventListener('change', onChartOptsChanged); });
+  ['fOutliers', 'fK', 'fStats', 'fStatsOut', 'fRuns'].forEach(function (id) { $(id).addEventListener('change', onChartOptsChanged); });
   function isPartial() { return loader.isBusy(); }
   function renderPartialBanner() {
     var b = $('partialBanner');
@@ -530,6 +548,7 @@
     state.selectedCoil = name;
     var coil = currentCoil();
     if (!coil) { showSummary(); return; }
+    if (state.tab !== 'charts') showTab('charts', true);
     $('summaryView').hidden = true; $('viewer').hidden = false;
     populateMeasurementSelect();
     $('viewerTitle').textContent = coil.name;
@@ -544,6 +563,7 @@
   $('backBtn').addEventListener('click', showSummary);
   function showSummary() {
     state.selectedCoil = null; state.currentKey = null;
+    if (state.tab !== 'charts') showTab('charts', true);
     $('viewer').hidden = true; $('summaryView').hidden = false;
     showMeasureNote(''); populateMeasurementSelect();
     renderCoilList();
@@ -639,7 +659,7 @@
       outTxt = spec0.outlierMode === 'exclude' ? ' · ' + spec0.outliers.count + ' outliers excluded'
              : ' · ' + spec0.outliers.count + ' outliers flagged (' + spec0.outliers.nPinned + ' off-scale)';
     }
-    $('posCaption').textContent = g.caption + (spec0.machine ? ' · ' + spec0.machine : '') + ' · ' + g.modeDir + '/' + spec0.fileName + outTxt;
+    $('posCaption').textContent = g.caption + (spec0.machine ? ' · ' + spec0.machine : '') + (spec0.runs !== 'all' ? ' · ' + spec0.runs + ' run of ' + spec0.runsCoils + ' coils' : '') + ' · ' + g.modeDir + '/' + spec0.fileName + outTxt;
     $('prevBtn').disabled = state.index === 0; $('nextBtn').disabled = state.index === n - 1;
     var spec = specFor(coil, g);
     var wrap = $('canvasWrap');
@@ -681,7 +701,7 @@
     tip.appendChild(el('div', { class: 'tt-m', text: info.machine + (info.port ? ' · Port ' + info.port : '') }));
     tip.appendChild(el('div', { text: 'SN ' + info.sn }));
     tip.appendChild(el('div', { text: T.formatDateTime(info.time) }));
-    tip.appendChild(el('div', { text: info.meas.toFixed(dec) + ' ' + units + (!isNaN(info.lsl) ? ' · LSL ' + info.lsl.toFixed(dec) : '') + (!isNaN(info.usl) ? ' · USL ' + info.usl.toFixed(dec) : '') }));
+    tip.appendChild(el('div', { text: info.meas.toFixed(dec) + ' ' + units + (!isNaN(info.lsl) ? ' · LSL ' + info.lsl.toFixed(dec) : '') + (!isNaN(info.usl) ? ' · USL ' + info.usl.toFixed(dec) : '') + (info.pf === 1 ? ' · PASS' : info.pf === 0 ? ' · FAIL' : '') }));
     var exDefs = CATE.MEASUREMENTS[spec.measurement].extras || {};
     var exTxt = Object.keys(exDefs).filter(function (k) { return info.extras && info.extras[k] === info.extras[k]; }).map(function (k) {
       var d = exDefs[k], v = info.extras[k];
@@ -802,9 +822,234 @@
   });
   $('zipCancel').addEventListener('click', function () { state.zipCancel = true; });
 
+  /* ---------------- tabs ---------------- */
+  $('tabCharts').addEventListener('click', function () { showTab('charts'); });
+  $('tabYield').addEventListener('click', function () { showTab('yield'); });
+  /* Switch between the run-chart pages (overview / viewer) and the Yield page. keepViewer: do not touch
+   * the viewer / overview visibility (openCoil and showSummary set it themselves). */
+  function showTab(tab, keepViewer) {
+    state.tab = tab;
+    $('tabCharts').classList.toggle('active', tab === 'charts'); $('tabCharts').setAttribute('aria-selected', tab === 'charts');
+    $('tabYield').classList.toggle('active', tab === 'yield'); $('tabYield').setAttribute('aria-selected', tab === 'yield');
+    if (tab === 'yield') {
+      $('summaryView').hidden = true; $('viewer').hidden = true; $('yieldView').hidden = false;
+      renderYield();
+    } else {
+      $('yieldView').hidden = true;
+      if (!keepViewer) { var open = !!(state.selectedCoil && currentCoil()); $('viewer').hidden = !open; $('summaryView').hidden = open; }
+    }
+  }
+
+  /* ---------------- yield ---------------- */
+  function syncYieldControls() {
+    var s = state.settings;
+    $('yGap').value = s.yieldGap; $('yTestKits').checked = !!s.yieldTestKits;
+    var btn = $('yExcludeBtn'), pred = excludePredicate(), n = 0;
+    if (model.hasData()) {
+      var inData = new Set();
+      model.serialList(s.yieldGap * 60000).forEach(function (e) { inData.add(e.sn.toLowerCase()); if (pred(e.sn)) n++; });
+      s.yieldExcludeOn.forEach(function (k) { if (!inData.has(k)) n++; });
+    } else n = s.yieldExcludeOn.length;
+    btn.textContent = n ? n + ' serial' + (n === 1 ? '' : 's') : 'None';
+    btn.classList.toggle('has-picks', n > 0);
+    $('yExcludeRule').checked = !!s.yieldExcludeRule;
+    var sel = $('yMachine'), machines = model.loadedMachines().map(function (m) { return m.name; });
+    fillSelect(sel, machines, s.yieldMachine, 'All machines');
+    if (machines.indexOf(s.yieldMachine) < 0) s.yieldMachine = '';
+  }
+  function onYieldOptsChanged() {
+    var s = state.settings;
+    var gap = parseFloat($('yGap').value); if (!(gap >= 1 && gap <= 1440)) { gap = s.yieldGap; $('yGap').value = gap; }
+    s.yieldGap = gap; s.yieldTestKits = $('yTestKits').checked; s.yieldMachine = $('yMachine').value;
+    saveSettings();
+    if (!$('yExcludePanel').hidden) buildExcludeList();   // the run count per serial depends on the gap
+    renderYield();
+  }
+  ['yGap', 'yTestKits', 'yMachine'].forEach(function (id) { $(id).addEventListener('change', onYieldOptsChanged); });
+  function yieldOptions() {
+    var s = state.settings;
+    return { gapMs: s.yieldGap * 60000, machine: s.yieldMachine ? CATE.MACHINES.indexOf(s.yieldMachine) : -1, includeTestKits: !!s.yieldTestKits, excludeSn: excludePredicate(), error: '' };
+  }
+
+  /* Exclude-serials dropdown: a searchable list of every raw serial number in the loaded data with tick boxes.
+   * A serial is excluded when it is ticked by hand (yieldExcludeOn), or when the default rule (CATE.isDummySerial:
+   * contains test / tst / eval, or not in the production format) applies and it was not unticked by hand (yieldExcludeOff).
+   * Hand-ticked serials are kept even when the loaded files do not contain them (shown struck through). */
+  var EXCLUDE_LIST_MAX = 300, excludeListVersion = -1;
+  function excludePredicate() {
+    var s = state.settings, on = new Set(s.yieldExcludeOn), off = new Set(s.yieldExcludeOff), rule = !!s.yieldExcludeRule;
+    return function (sn) { var k = sn.toLowerCase(); return on.has(k) || (rule && !off.has(k) && CATE.isDummySerial(sn)); };
+  }
+  function setExcluded(sn, on) {
+    var s = state.settings, k = sn.toLowerCase(), byRule = !!s.yieldExcludeRule && CATE.isDummySerial(sn);
+    function drop(arr, v) { var i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); }
+    if (on) { drop(s.yieldExcludeOff, k); if (!byRule && s.yieldExcludeOn.indexOf(k) < 0) s.yieldExcludeOn.push(k); }
+    else { drop(s.yieldExcludeOn, k); if (byRule && s.yieldExcludeOff.indexOf(k) < 0) s.yieldExcludeOff.push(k); }
+    saveSettings();
+    renderYield();                                            // refreshes the button label too; the open list is left as it is
+  }
+  function buildExcludeList() {
+    var list = $('yExcludeList'), note = $('yExcludeNote'), q = $('yExcludeSearch').value.trim().toLowerCase();
+    var s = state.settings, pred = excludePredicate(), gapMs = s.yieldGap * 60000;
+    var all = model.hasData() ? model.serialList(gapMs) : [], inData = new Set();
+    all.forEach(function (e) { inData.add(e.sn.toLowerCase()); });
+    var missing = s.yieldExcludeOn.filter(function (k) { return !inData.has(k); }).map(function (k) { return { sn: k, variants: [], runs: 0, coils: 0, missing: true }; });
+    var rows = missing.concat(all).filter(function (e) { return !q || e.sn.toLowerCase().indexOf(q) >= 0; });
+    rows.sort(function (a, b) { return (pred(b.sn) ? 1 : 0) - (pred(a.sn) ? 1 : 0); });   // ticked first, stable otherwise
+    list.innerHTML = '';
+    excludeListVersion = model.version;
+    if (!rows.length) {
+      list.appendChild(el('div', { class: 'dd-empty', text: all.length ? 'No serial number contains "' + q + '".' : 'Load data files to list the serial numbers.' }));
+      note.textContent = ''; return;
+    }
+    rows.slice(0, EXCLUDE_LIST_MAX).forEach(function (e) {
+      var meta = e.missing ? 'not in the loaded data' :
+        fmtInt(e.runs) + ' run' + (e.runs === 1 ? '' : 's') + (e.failed ? ', ' + fmtInt(e.failed) + ' failed' : '') + ' · ' + (e.coils === 1 ? e.coilNames[0] : e.coils + ' coil types') +
+        (e.variants.length ? ' · also ' + e.variants.join(', ') : '');
+      var cb = el('input', { type: 'checkbox', onchange: function () { setExcluded(e.sn, cb.checked); } });
+      cb.checked = pred(e.sn);
+      var tag = !e.missing && s.yieldExcludeRule && e.dummy ? el('span', { class: 'tag', text: 'rule', title: 'Ticked by the default rule' }) : null;
+      list.appendChild(el('label', { class: 'dd-item' + (e.missing ? ' missing' : ''), title: e.missing ? 'Ticked earlier; the loaded files hold no run with this serial' : (e.coils > 1 ? e.coilNames.join(', ') + (e.coils > 3 ? ', …' : '') : '') },
+        [cb, el('span', { class: 'sn', text: e.sn }), tag, el('span', { class: 'meta', text: meta })]));
+    });
+    note.textContent = rows.length > EXCLUDE_LIST_MAX ? 'Showing ' + EXCLUDE_LIST_MAX + ' of ' + fmtInt(rows.length) + ' serials · type to narrow the list' :
+      fmtInt(rows.length) + ' serial' + (rows.length === 1 ? '' : 's') + (q ? ' match' : '');
+  }
+  function openExcludeDd(open) {
+    var panel = $('yExcludePanel');
+    if (open === !panel.hidden) return;
+    panel.hidden = !open; $('yExcludeBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) { buildExcludeList(); $('yExcludeSearch').focus(); }
+  }
+  $('yExcludeBtn').addEventListener('click', function () { openExcludeDd($('yExcludePanel').hidden); });
+  $('yExcludeSearch').addEventListener('input', buildExcludeList);
+  function setExcludeRule(rule, on, off) { var s = state.settings; s.yieldExcludeRule = rule; s.yieldExcludeOn = on; s.yieldExcludeOff = off; saveSettings(); if (!$('yExcludePanel').hidden) buildExcludeList(); renderYield(); }
+  $('yExcludeRule').addEventListener('change', function () { setExcludeRule(this.checked, state.settings.yieldExcludeOn, state.settings.yieldExcludeOff); });
+  $('yExcludeReset').addEventListener('click', function () { setExcludeRule(true, [], []); });
+  $('yExcludeClear').addEventListener('click', function () { setExcludeRule(false, [], []); });
+  document.addEventListener('click', function (e) { if (!$('yExcludeDd').contains(e.target)) openExcludeDd(false); });
+  document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('yExcludePanel').hidden) { openExcludeDd(false); $('yExcludeBtn').focus(); } });
+  function fmtPct(v) { return v === v ? v.toFixed(1) + ' %' : '—'; }
+  function pctBar(v) {
+    var wrap = el('span', { class: 'pbar', title: fmtPct(v) });
+    if (v === v) wrap.appendChild(el('span', { class: 'pfill' + (v < 70 ? ' low' : v < 90 ? ' mid' : ''), style: 'width:' + Math.max(0, Math.min(100, v)).toFixed(1) + '%' }));
+    return wrap;
+  }
+  var yieldReport = null;
+  function renderYield() {
+    if ($('yieldView').hidden) return;
+    syncYieldControls();
+    var tiles = $('yieldTiles'), tbl = $('yieldTable'), intro = $('yieldIntro'), noteEl = $('yieldNote');
+    tiles.innerHTML = ''; tbl.innerHTML = ''; $('yError').textContent = ''; noteEl.hidden = true; noteEl.textContent = '';
+    yieldReport = null;
+    if (!model.hasData()) { intro.textContent = 'Load data files (step 1) to compute first pass yield.'; return; }
+    var rs = resolvedSettings();
+    if (rs.error) { intro.textContent = ''; $('yError').textContent = rs.error; return; }
+    var o = yieldOptions();
+    if (!$('yExcludePanel').hidden && excludeListVersion !== model.version) buildExcludeList();   // more files arrived while the list was open
+    var rep = yieldReport = model.yieldReport(rs, o);
+    var gapTxt = (rep.gapMs / 60000) + ' min';
+    intro.textContent = 'A run is one pass of a tester over a coil: its rows across every loaded table (' + rep.tables.join(', ') + ') in time order; a new run starts after a gap of ' + gapTxt +
+      ' or when a test repeats. A run fails when any row fails. A serial number counts when its first run' + (rep.machine ? ' on ' + rep.machine : '') + ' starts in the date range ' + state.settings.start + ' – ' + state.settings.end +
+      ' (per-coil overrides apply); first pass yield is the share of those coils whose first run passed, final yield the share whose latest run passed' +
+      (rep.skippedTestKits ? '; ' + rep.skippedTestKits + ' test kit coil type' + (rep.skippedTestKits === 1 ? '' : 's') + ' skipped' : '') + '.' + (isPartial() ? ' Files are still loading: partial data.' : '');
+    var t = rep.total;
+    // loaded machines that contribute nothing: no coil had its first run on them inside the date range
+    var withRuns = new Set(rep.total.byMachine.map(function (x) { return x.machine; }));
+    var idle = model.loadedMachines().filter(function (mm) { return !withRuns.has(mm.name) && (!rep.machine || rep.machine === mm.name); });
+    if (idle.length) {
+      var parts = idle.map(function (mm) {
+        var ext = model.machineExtent(mm.index);
+        return mm.name + (ext ? ' (its data spans ' + T.formatDate(ext.tMin) + ' – ' + T.formatDate(ext.tMax) + ')' : '');
+      });
+      noteEl.textContent = (idle.length === 1 ? parts[0] + ' has' : parts.join(', ') + ' have') + ' no coil whose first run starts between ' + state.settings.start + ' and ' + state.settings.end +
+        ', so ' + (idle.length === 1 ? 'it adds' : 'they add') + ' nothing to the yield below. Widen the date range with the presets on the left' +
+        ' (All data covers everything loaded); if a file should hold newer tests, copy the current database from that tester.';
+      noteEl.hidden = false;
+    }
+    [['Coil types', fmtInt(rep.coils.length), ''],
+     ['Coils tested', fmtInt(t.tested), t.unjudged ? fmtInt(t.unjudged) + ' unjudged' : ''],
+     ['First pass yield', fmtPct(t.fpyPct), fmtInt(t.firstPass) + ' of ' + fmtInt(t.judged) + ' passed first time'],
+     ['Final yield', fmtPct(t.finalPct), fmtInt(t.finalPass) + ' of ' + fmtInt(t.judged) + ' passed on their latest run'],
+     ['Retested coils', fmtInt(t.retested), t.tested ? (t.retested / t.tested * 100).toFixed(1) + ' % of coils tested' : ''],
+     ['Runs', fmtInt(t.runs), fmtInt(t.runsFailed) + ' failed' + (t.excluded ? ' · ' + fmtInt(t.excluded) + ' serial' + (t.excluded === 1 ? '' : 's') + ' excluded' : '')]
+    ].forEach(function (x) { tiles.appendChild(el('div', { class: 'tile' }, [el('div', { class: 'tv', text: x[1] }), el('div', { class: 'tl', text: x[0] }), x[2] ? el('div', { class: 'ts', text: x[2] }) : null])); });
+    if (!rep.coils.length) {
+      var ext = dataExtent();
+      tbl.appendChild(el('div', { class: 'muted', text: 'No coil had its first run' + (rep.machine ? ' on ' + rep.machine : '') + ' in the selected date range' +
+        (!idle.length && ext ? ' (data spans ' + T.formatDate(ext.min) + ' – ' + T.formatDate(ext.max) + '; use the range presets on the left)' : '') + '.' }));
+      return;
+    }
+    var table = el('table');
+    table.appendChild(el('thead', null, [el('tr', null, [
+      el('th', { text: 'Coil type' }), el('th', { class: 'num', text: 'Coils tested' }), el('th', { class: 'num', text: 'First pass' }),
+      el('th', { text: 'First pass yield' }), el('th', { class: 'num', text: 'Retested' }), el('th', { text: 'Final yield' }),
+      el('th', { class: 'num', text: 'Runs' }), el('th', { text: 'First-run failure rate by table', title: 'Share of first runs that failed each result table; open the row for the counts' })])]));
+    var tb = el('tbody');
+    function failChips(a) {
+      var td = el('td');
+      a.byMeas.filter(function (x) { return x.failed > 0; }).sort(function (x, y) { return y.failed / y.judged - x.failed / x.judged || y.failed - x.failed; })
+        .forEach(function (x) { td.appendChild(el('span', { class: 'fail-chip', title: x.failed + ' of ' + x.judged + ' first runs failed ' + x.label, text: x.label + ' ' + (x.failed / x.judged * 100).toFixed(1) + ' %' })); });
+      return td;
+    }
+    function mainRow(a, cls) {
+      var isOpen = !!state.yieldOpen[a.coil];
+      var tr = el('tr', { class: cls }, [
+        el('td', null, [cls === 'coil-row' ? el('span', { class: 'caret', text: isOpen ? '▼' : '▶' }) : null, el('span', { text: a.coil }), a.override ? el('span', { class: 'muted small', text: ' (custom range)', title: T.formatDate(a.start) + ' – ' + T.formatDate(a.endIncl) }) : null]),
+        el('td', { class: 'num', text: fmtInt(a.tested), title: a.unjudged ? a.unjudged + ' unjudged (no pass/fail recorded)' + (a.excluded ? ', ' + a.excluded + ' excluded serial' + (a.excluded === 1 ? '' : 's') : '') : (a.excluded ? a.excluded + ' excluded serial' + (a.excluded === 1 ? '' : 's') : '') }),
+        el('td', { class: 'num', text: fmtInt(a.firstPass) }),
+        el('td', { class: 'pct' }, [pctBar(a.fpyPct), fmtPct(a.fpyPct)]),
+        el('td', { class: 'num', text: fmtInt(a.retested) }),
+        el('td', { class: 'pct' }, [pctBar(a.finalPct), fmtPct(a.finalPct)]),
+        el('td', { class: 'num', text: fmtInt(a.runs), title: fmtInt(a.runsFailed) + ' failed' }),
+        failChips(a)]);
+      if (isOpen) tr.classList.add('open');
+      return tr;
+    }
+    function detailRow(a) {
+      var byMeas = el('table'); byMeas.appendChild(el('thead', null, [el('tr', null, [el('th', { text: 'Table' }), el('th', { class: 'num', text: 'First runs judged' }), el('th', { class: 'num', text: 'Failed' }), el('th', { class: 'num', text: 'Fail %' })])]));
+      var b1 = el('tbody'); a.byMeas.forEach(function (x) { b1.appendChild(el('tr', null, [el('td', { text: x.label }), el('td', { class: 'num', text: fmtInt(x.judged) }), el('td', { class: 'num', text: fmtInt(x.failed) }), el('td', { class: 'num', text: (x.failed / x.judged * 100).toFixed(1) })])); }); byMeas.appendChild(b1);
+      var byMach = el('table'); byMach.appendChild(el('thead', null, [el('tr', null, [el('th', { text: 'Machine' }), el('th', { class: 'num', text: 'Coils' }), el('th', { class: 'num', text: 'First pass' }), el('th', { class: 'num', text: 'FPY %' })])]));
+      var b2 = el('tbody'); a.byMachine.forEach(function (x) { var j = x.pass + x.fail; b2.appendChild(el('tr', null, [el('td', { text: x.machine }), el('td', { class: 'num', text: fmtInt(x.tested) }), el('td', { class: 'num', text: fmtInt(x.pass) }), el('td', { class: 'num', text: j ? (x.pass / j * 100).toFixed(1) : '—' })])); }); byMach.appendChild(b2);
+      var tests = el('table'); tests.appendChild(el('thead', null, [el('tr', null, [el('th', { text: 'Test' }), el('th', { class: 'num', text: 'Coils failing on first run' })])]));
+      var b3 = el('tbody'), top = a.failTests.slice(0, 12);
+      top.forEach(function (x) { b3.appendChild(el('tr', null, [el('td', { text: x.test }), el('td', { class: 'num', text: fmtInt(x.coils) })])); });
+      if (!top.length) b3.appendChild(el('tr', null, [el('td', { class: 'muted', text: 'No first-run failures' }), el('td')]));
+      tests.appendChild(b3);
+      var grid = el('div', { class: 'detail-grid' }, [
+        el('div', null, [el('h4', { text: 'By table (first runs)' }), byMeas]),
+        el('div', null, [el('h4', { text: 'By machine (first runs)' }), byMach]),
+        el('div', null, [el('h4', { text: 'Top failing tests' + (a.failTests.length > 12 ? ' (12 of ' + a.failTests.length + ')' : '') }), tests])]);
+      var open = el('div', { class: 'actions' }, [el('button', { class: 'btn btn-small', text: 'Open run charts', onclick: function () { openCoil(a.coil, false); } })]);
+      return el('tr', { class: 'detail' }, [el('td', { colspan: '8' }, [grid, open])]);
+    }
+    tb.appendChild(mainRow(t, 'total'));
+    rep.coils.forEach(function (a) {
+      var tr = mainRow(a, 'coil-row');
+      tr.addEventListener('click', function () { state.yieldOpen[a.coil] = !state.yieldOpen[a.coil]; renderYield(); });
+      tb.appendChild(tr);
+      if (state.yieldOpen[a.coil]) tb.appendChild(detailRow(a));
+    });
+    table.appendChild(tb); tbl.appendChild(table);
+  }
+  $('yExport').addEventListener('click', function () {
+    if (!yieldReport) return;
+    var rows = yieldReport.coils.concat([yieldReport.total]).map(function (a) {
+      return { coil: a.coil, coilsTested: a.tested, judged: a.judged, firstPass: a.firstPass, firstFail: a.firstFail, unjudged: a.unjudged,
+               firstPassYieldPct: a.fpyPct === a.fpyPct ? a.fpyPct.toFixed(2) : '', retested: a.retested, finalPass: a.finalPass, finalYieldPct: a.finalPct === a.finalPct ? a.finalPct.toFixed(2) : '',
+               runs: a.runs, runsFailed: a.runsFailed, serialsExcluded: a.excluded,
+               firstRunFailuresByTable: a.byMeas.filter(function (x) { return x.failed; }).map(function (x) { return x.label + ' ' + x.failed + '/' + x.judged; }).join('; '),
+               firstRunFailuresByMachine: a.byMachine.map(function (x) { return x.machine + ' ' + x.fail + '/' + (x.pass + x.fail); }).join('; '),
+               topFailingTests: a.failTests.slice(0, 10).map(function (x) { return x.test + ' (' + x.coils + ')'; }).join('; ') };
+    });
+    var cols = ['coil', 'coilsTested', 'judged', 'firstPass', 'firstFail', 'unjudged', 'firstPassYieldPct', 'retested', 'finalPass', 'finalYieldPct', 'runs', 'runsFailed', 'serialsExcluded', 'firstRunFailuresByTable', 'firstRunFailuresByMachine', 'topFailingTests'];
+    download(new Blob([CATE.toCsv(rows, cols)], { type: 'text/csv' }), 'first_pass_yield_' + state.settings.start + '_' + state.settings.end + (yieldReport.machine ? '_' + yieldReport.machine : '') + '.csv');
+  });
+
   /* ---------------- init ---------------- */
   syncRangeInputs();
   syncOutlierControls();
+  syncYieldControls();
   updateCoilDatalist();
   populateMeasurementSelect();
   renderFileTable();
@@ -821,6 +1066,10 @@
       return false;
     },
     hoverAt: showTooltipAt,
+    showTab: showTab, yieldReport: function () { return yieldReport; },
+    setRuns: function (runs) { $('fRuns').value = runs; onChartOptsChanged(); },
+    setYieldExclude: function (list, rule) { setExcludeRule(!!rule, normSerials(list), []); },
+    openExcludeDd: openExcludeDd,
     setMeasurement: function (k) { if (!CATE.MEASUREMENTS[k]) return; $('fMeasure').value = k; $('fMeasure').dispatchEvent(new Event('change')); },
     setOutliers: function (mode, k, stats, statsOutliers) {
       if (mode) $('fOutliers').value = mode;

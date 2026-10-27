@@ -52,6 +52,10 @@ a:hover { color: var(--purple-dark); }
 .topbar { height: 52px; display: flex; align-items: center; gap: 20px; padding: 0 18px; background: var(--purple); color: #fff; box-shadow: 0 1px 0 var(--purple-dark); }
 .brand { font-weight: 600; font-size: 16px; white-space: nowrap; letter-spacing: 0.1px; display: flex; align-items: center; gap: 10px; }
 .brand::before { content: ""; width: 10px; height: 10px; border-radius: 50%; background: var(--turquoise); box-shadow: 0 0 0 3px rgba(255,255,255,0.25); }
+.tabs { display: inline-flex; gap: 2px; margin-left: 10px; }
+.tabs button { border: none; background: transparent; color: rgba(255,255,255,0.8); padding: 6px 12px; font-size: 13px; cursor: pointer; border-radius: 6px; }
+.tabs button:hover { background: rgba(255,255,255,0.12); color: #fff; }
+.tabs button.active { background: #fff; color: var(--purple-dark); font-weight: 600; }
 .topbar-status { margin-left: auto; font-size: 13px; opacity: 0.95; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .topbar-progress { display: flex; align-items: center; gap: 10px; flex: 1; max-width: 440px; font-size: 12px; }
 .bar { flex: 1; height: 8px; background: rgba(255,255,255,0.25); border-radius: 4px; overflow: hidden; }
@@ -193,6 +197,56 @@ label { font-size: 12px; color: var(--muted); display: inline-flex; flex-directi
 .card canvas { display: block; width: 100%; aspect-ratio: 13 / 7; background: #fafafa; }
 .card .cap { font-size: 12px; margin-top: 4px; color: var(--muted); display: flex; justify-content: space-between; gap: 6px; }
 .card .cap b { color: var(--text); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* yield */
+#yGap { width: 72px; }
+/* tick-box dropdown (serials to exclude) */
+.dd { position: relative; display: inline-flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+.dd-btn { border: 1px solid var(--border); border-radius: 6px; padding: 5px 26px 5px 8px; font-size: 13px; background: #fff; color: var(--text); cursor: pointer; text-align: left; min-width: 150px; max-width: 260px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; position: relative; }
+.dd-btn::after { content: ''; position: absolute; right: 10px; top: 50%; width: 0; height: 0; margin-top: -2px; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 5px solid var(--purple-dark); }
+.dd-btn:hover, .dd-btn[aria-expanded="true"] { border-color: var(--purple-60); }
+.dd-btn[aria-expanded="true"] { box-shadow: 0 0 0 3px var(--purple-20); }
+.dd-btn.has-picks { color: var(--purple-dark); font-weight: 600; }
+.dd-panel { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20; width: 380px; max-width: calc(100vw - 48px); background: #fff; border: 1px solid var(--purple-40); border-radius: var(--radius); box-shadow: 0 6px 20px rgba(76,27,133,0.18); padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.dd-panel input[type="search"] { width: 100%; box-sizing: border-box; }
+.dd-list { max-height: 280px; overflow-y: auto; border: 1px solid var(--border); border-radius: 6px; }
+.dd-item { display: flex; flex-direction: row; align-items: center; gap: 8px; padding: 4px 8px; font-size: 13px; color: var(--text); cursor: pointer; }
+.dd-item:hover { background: var(--purple-05); }
+.dd-item input { accent-color: var(--purple); width: 15px; height: 15px; flex: 0 0 auto; }
+.dd-item .sn { font-family: Consolas, 'Courier New', monospace; flex: 0 0 auto; }
+.dd-item .meta { color: var(--muted); font-size: 11px; margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dd-item.missing .sn { color: var(--muted); text-decoration: line-through; }
+.dd-empty { padding: 10px; color: var(--muted); font-size: 12px; }
+.dd-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.dd-foot .btn { white-space: nowrap; flex: 0 0 auto; }
+.dd-foot .check { padding-bottom: 0; }
+.dd-spacer { flex: 1; }
+.dd-item .tag { flex: 0 0 auto; font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 7px; background: var(--purple-10); color: var(--purple-dark); }
+/* the coil type table keeps its header row in view while the page scrolls */
+#yieldTable > table > thead th { position: sticky; top: -18px; z-index: 2; box-shadow: 0 1px 0 var(--border); }   /* -18px: the .main padding, so nothing scrolls past above the header */
+.tiles { display: flex; flex-wrap: wrap; gap: 10px; margin: 12px 0 18px; }
+.tile { background: #fff; border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 14px; min-width: 140px; border-top: 3px solid var(--purple); }
+.tile .tv { font-size: 22px; font-weight: 600; color: var(--purple-dark); font-variant-numeric: tabular-nums; line-height: 1.2; }
+.tile .tl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.tile .ts { font-size: 11px; color: var(--muted); }
+.yield table { width: 100%; }
+.yield tbody tr.coil-row { cursor: pointer; }
+.yield tbody tr.coil-row:hover td { background: var(--purple-05); }
+.yield tbody tr.coil-row.open td { background: var(--purple-10); }
+.yield tbody tr.total td { font-weight: 600; background: var(--purple-05); }
+.yield td.pct { white-space: nowrap; }
+.pbar { display: inline-block; width: 90px; height: 9px; background: var(--purple-10); border-radius: 5px; vertical-align: middle; margin-right: 8px; overflow: hidden; }
+.pbar .pfill { height: 100%; background: var(--purple); }
+.pbar .pfill.low { background: var(--coral); }
+.pbar .pfill.mid { background: var(--yellow); }
+.yield .fail-chip { display: inline-block; margin: 1px 4px 1px 0; padding: 0 7px; border-radius: 10px; background: #FDE7E0; color: var(--coral-dark); font-size: 12px; line-height: 18px; white-space: nowrap; }
+.yield .detail td { background: #fbfafd; padding: 10px 14px 14px; }
+.yield .detail-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px 24px; }
+.yield .detail h4 { margin: 0 0 4px; font-size: 13px; color: var(--purple-dark); }
+.yield .detail table { width: auto; margin: 0; font-size: 12px; }
+.yield .detail th, .yield .detail td { padding: 3px 8px; background: #fff; }
+.yield .detail th { background: var(--purple-05); }
+.yield .caret { display: inline-block; width: 12px; color: var(--muted); font-size: 11px; }
 
 /* modal */
 .modal { position: fixed; inset: 0; background: rgba(76,27,133,0.35); display: flex; align-items: center; justify-content: center; z-index: 20; }

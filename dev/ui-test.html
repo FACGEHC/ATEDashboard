@@ -31,6 +31,13 @@
     }
     // preset=all|last7|last30|ytd: click that date-range preset, then rebuild synchronously
     function applyPreset() {
+      var dr = /dates=(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})/.exec(q);   // dates=YYYY-MM-DD..YYYY-MM-DD: type a date range; noov drops the per-coil overrides
+      if (dr || /noov/.test(q)) {
+        var d0 = f.contentDocument;
+        if (/noov/.test(q)) { app.state.settings.overrides = []; }
+        if (dr) { d0.getElementById('startDate').value = dr[1]; d0.getElementById('startDate').dispatchEvent(new w.Event('change')); d0.getElementById('endDate').value = dr[2]; d0.getElementById('endDate').dispatchEvent(new w.Event('change')); }
+        app.generate(); console.log('dates ' + app.state.settings.start + '..' + app.state.settings.end + ', overrides ' + app.state.settings.overrides.length);
+      }
       var pr = /preset=(\w+)/.exec(q);
       if (!pr) return;
       var btn = f.contentDocument.querySelector('[data-preset="' + pr[1] + '"]');
@@ -53,11 +60,37 @@
           if (ch) { var parts = decodeURIComponent(ch[1]).split('/'); console.log('goTo ' + parts.join('/') + ' -> ' + app.goTo(parts[0], parts[1])); }
           var mm = /machine=((?:CATE|EVO|NATE)\d+)/.exec(q);
           if (mm) { var sel = f.contentDocument.getElementById('fMachine'); sel.value = mm[1]; sel.dispatchEvent(new w.Event('change')); }
+          var rn = /runs=(all|latest|first)/.exec(q);   // runs=latest: keep one point per coil (latest / first run)
+          if (rn) { app.setRuns(rn[1]); var sp0 = app.state.currentSpec; console.log('runs ' + rn[1] + ' -> ' + (sp0 ? sp0.series.map(function (s) { return s.machine + ' ' + s.xs.length + ' pts / ' + s.nCoils + ' coils'; }).join(', ') + ' · ' + sp0.title2 + ' · ' + sp0.fileName : 'no spec')); }
           if (/lib/.test(q)) app.setViewMode('library');
           if (/partial/.test(q)) {
             // now start CATE1001 to show the partial banner while it loads
             app.loader.workersBlocked = true;
             app.loadFiles([new w.File([window.SAMPLE_CSV.CATE1001], 'CATE1001.csv')]);
+          }
+        }
+        if (/yield/.test(q)) {   // yield=1[&yopen=<coil>][&ygap=N][&ykits=1][&yexclude=<sn,sn,...>][&ymachine=<name>][&ydd=1|<search>]: open the Yield tab and report
+          var d = f.contentDocument, yg = /ygap=(\d+)/.exec(q), yx = /yexclude=([^&]*)/.exec(q), ym = /ymachine=(\w+)/.exec(q);
+          app.showTab('yield');
+          if (yg) { d.getElementById('yGap').value = yg[1]; d.getElementById('yGap').dispatchEvent(new w.Event('change')); }
+          if (yx) app.setYieldExclude(decodeURIComponent(yx[1]).split(',').filter(Boolean), /yrule=1/.test(q));   // yexclude=a,b ticks those (rule off unless yrule=1); yexclude= alone clears
+          if (/ykits=1/.test(q)) { d.getElementById('yTestKits').checked = true; d.getElementById('yTestKits').dispatchEvent(new w.Event('change')); }
+          if (ym) { d.getElementById('yMachine').value = ym[1]; d.getElementById('yMachine').dispatchEvent(new w.Event('change')); }
+          var yo = /yopen=([^&]+)/.exec(q);
+          if (yo) { Array.prototype.forEach.call(d.querySelectorAll('#yieldTable tr.coil-row'), function (r) { if (r.cells[0].textContent.replace(/^[▶▼]/, '').trim().indexOf(decodeURIComponent(yo[1])) === 0) r.click(); }); }
+          var yr = app.yieldReport();
+          console.log('yield: ' + (yr ? yr.coils.length + ' coil types, total ' + JSON.stringify({ tested: yr.total.tested, firstPass: yr.total.firstPass, firstFail: yr.total.firstFail, unjudged: yr.total.unjudged, fpy: +yr.total.fpyPct.toFixed(1), final: +yr.total.finalPct.toFixed(1), retested: yr.total.retested, runs: yr.total.runs, excluded: yr.total.excluded, kits: yr.skippedTestKits, machine: yr.machine }) : 'none'));
+          if (yr) yr.coils.forEach(function (c) { console.log('  ' + c.coil + ': tested ' + c.tested + ' fpy ' + (c.fpyPct === c.fpyPct ? c.fpyPct.toFixed(1) : '-') + ' final ' + (c.finalPct === c.finalPct ? c.finalPct.toFixed(1) : '-') + ' retested ' + c.retested + ' runs ' + c.runs + ' tables ' + c.byMeas.map(function (x) { return x.label + ' ' + x.failed + '/' + x.judged; }).join(', ') + ' machines ' + c.byMachine.map(function (x) { return x.machine + ' ' + x.pass + '/' + (x.pass + x.fail); }).join(', ') + (c.failTests.length ? ' top ' + c.failTests[0].test + '=' + c.failTests[0].coils : '')); });
+          console.log('yield tiles: ' + Array.prototype.map.call(d.querySelectorAll('#yieldTiles .tile'), function (t) { return t.textContent; }).join(' | '));
+          console.log('yield note: ' + (d.getElementById('yieldNote').hidden ? '(hidden)' : d.getElementById('yieldNote').textContent));
+          var scr = /scroll=(\d+)/.exec(q);   // scroll=N: scroll the main pane by N px (sticky header check)
+          if (scr) { d.querySelector('.main').scrollTop = +scr[1]; console.log('scrolled main to ' + d.querySelector('.main').scrollTop); }
+          var yd = /ydd=([^&]*)/.exec(q);   // ydd=1 or ydd=<text>: open the exclude-serials dropdown (typing the text into its search box) and log what it lists
+          if (yd) {
+            app.openExcludeDd(true);
+            if (yd[1] !== '1') { d.getElementById('yExcludeSearch').value = decodeURIComponent(yd[1]); d.getElementById('yExcludeSearch').dispatchEvent(new w.Event('input')); }
+            var items = Array.prototype.map.call(d.querySelectorAll('#yExcludeList .dd-item'), function (it) { return (it.querySelector('input').checked ? '[x] ' : '[ ] ') + it.querySelector('.sn').textContent + (it.querySelector('.tag') ? ' [rule]' : '') + ' (' + it.querySelector('.meta').textContent + ')'; });
+            console.log('exclude dd: button "' + d.getElementById('yExcludeBtn').textContent + '", note "' + d.getElementById('yExcludeNote').textContent + '", ' + items.length + ' items: ' + items.slice(0, 8).join(' | '));
           }
         }
         var tm = /thenmeas=(\w+)/.exec(q);   // thenmeas=Noise: pick a measurement from the viewer dropdown after the coil opened (tests the "none for this coil" guard)

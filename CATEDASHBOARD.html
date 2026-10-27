@@ -9,6 +9,10 @@
 <body>
 <header class="topbar">
   <div class="brand">ATE Run Chart Dashboard</div>
+  <nav class="tabs" role="tablist">
+    <button id="tabCharts" class="active" role="tab" aria-selected="true">Run charts</button>
+    <button id="tabYield" role="tab" aria-selected="false">Yield</button>
+  </nav>
   <div class="topbar-progress" id="globalProgress" hidden>
     <div class="bar"><div class="fill" id="globalProgressFill"></div></div>
     <span id="globalProgressLabel"></span>
@@ -101,6 +105,7 @@
         <label id="tcFilter">Test case <select id="fTc"></select></label>
         <label id="netFilter" hidden><span id="netFilterLabel">Net</span> <select id="fNet"></select></label>
         <label id="portFilter" hidden>Port <select id="fPort"></select></label>
+        <label title="A coil that failed and was retested has several rows per test. Latest / first keep one point per serial number: the row at its latest / first test date on this chart."><span>Runs</span> <select id="fRuns"><option value="all">All runs</option><option value="latest">Latest per coil</option><option value="first">First per coil</option></select></label>
         <label>Outliers <select id="fOutliers"><option value="flag">Flag (off-scale band)</option><option value="exclude">Exclude</option><option value="off">Off</option></select></label>
         <label>k (MAD) <input type="number" id="fK" min="1" max="20" step="0.5" title="Modified z-score threshold: |y - median| / (1.4826 x MAD) > k"></label>
         <label class="check"><input type="checkbox" id="fStats"> Statistics</label>
@@ -127,6 +132,36 @@
       <div id="libraryView" class="library" hidden>
         <div class="grid" id="libraryGrid"></div>
       </div>
+    </div>
+
+    <div id="yieldView" class="summary yield" hidden>
+      <h1>First pass yield</h1>
+      <p class="muted" id="yieldIntro"></p>
+      <div class="filters yield-controls">
+        <label>Machine <select id="yMachine"></select></label>
+        <label title="Rows of one serial number closer together than this belong to the same run. A run also ends when a test repeats (the tester started the sequence again)."><span>New run after (min)</span> <input type="number" id="yGap" min="1" max="1440" step="1"></label>
+        <div class="dd" id="yExcludeDd">
+          <span class="dd-label">Exclude serials</span>
+          <button type="button" class="dd-btn" id="yExcludeBtn" aria-haspopup="listbox" aria-expanded="false" title="Runs recorded under a ticked serial number are left out of the yield. By default every serial that contains test, tst or eval, or that is not in the production format (up to five digits, optionally -digits), is ticked; tick or untick any serial to override.">None</button>
+          <div class="dd-panel" id="yExcludePanel" hidden>
+            <input type="search" id="yExcludeSearch" placeholder="Find a serial…" autocomplete="off">
+            <div class="dd-list" id="yExcludeList" role="listbox" aria-multiselectable="true"></div>
+            <div class="dd-foot">
+              <label class="check" title="Tick every serial that contains test, tst or eval, or that is not in the production format: up to five digits, optionally followed by a dash and digits (e.g. 00827-301424423). Your own ticks and unticks stay on top of the rule."><input type="checkbox" id="yExcludeRule"> Default rule</label>
+              <span class="dd-spacer"></span>
+              <button type="button" class="btn btn-small" id="yExcludeReset" title="Back to the default rule with no overrides">Reset</button>
+              <button type="button" class="btn btn-small" id="yExcludeClear" title="Untick everything (rule off)">Clear all</button>
+            </div>
+            <div class="muted small" id="yExcludeNote"></div>
+          </div>
+        </div>
+        <label class="check" title="Coil types whose name contains 'Test Kit' are skipped unless this is on"><input type="checkbox" id="yTestKits"> Include test kits</label>
+        <button class="btn btn-small" id="yExport">Export CSV</button>
+        <span class="error small" id="yError"></span>
+      </div>
+      <div class="banner warn" id="yieldNote" hidden></div>
+      <div class="tiles" id="yieldTiles"></div>
+      <div id="yieldTable"></div>
     </div>
 
     <div class="modal" id="zipModal" hidden>

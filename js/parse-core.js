@@ -164,7 +164,8 @@ function cateParseCore() {
       lsl: new Col(Float64Array), usl: new Col(Float64Array),
       tc: new Col(Int32Array), coil: new Col(Int32Array), mode: new Col(Int32Array),
       chan: new Col(Int32Array), elem: new Col(Int32Array), net: new Col(Int32Array),
-      sn: new Col(Int32Array), units: new Col(Int32Array), port: new Col(Int32Array)
+      sn: new Col(Int32Array), units: new Col(Int32Array), port: new Col(Int32Array),
+      pf: new Col(Int8Array)                              // PassFail verdict of the row: 1 PASS, 0 FAIL, -1 none / NA
     };
     this.extras = [];                                   // [{ name, idx, col }] filled by setHeader
     this.stats = {
@@ -223,8 +224,10 @@ function cateParseCore() {
     // units: the Units column, unless it is missing / NA / a PASS-FAIL token (SCPre exports swap
     // PassFail and Units in some rows), in which case try PassFail, then the schema default
     var units = ci.Units !== undefined ? fields[ci.Units].trim() : '';
-    if (!isUnits(units) && ci.PassFail !== undefined) units = fields[ci.PassFail].trim();
+    var pfRaw = ci.PassFail !== undefined ? fields[ci.PassFail].trim() : '';
+    if (!isUnits(units) && ci.PassFail !== undefined) { var swap = units; units = pfRaw; pfRaw = swap; }
     if (!isUnits(units)) units = '';
+    var pf = /^pass$/i.test(pfRaw) ? 1 : (/^fail$/i.test(pfRaw) ? 0 : -1);
     if (this.measurement === null) {               // Sensitivity vs MCBias decided by the first row
       this.measurement = measurementFromUnits(units);
       this.spec = MEASUREMENTS[this.measurement];
@@ -247,6 +250,7 @@ function cateParseCore() {
     cols.sn.push(snId);
     cols.units.push(dicts.units.id(units));
     cols.port.push(portId);
+    cols.pf.push(pf);
     for (var x = 0; x < this.extras.length; x++) { var ex = this.extras[x]; ex.col.push(ex.idx === undefined ? NaN : parseNum(fields[ex.idx].trim())); }
     stats.rowsKept++;
     if (t < stats.tMin) stats.tMin = t;

@@ -3,6 +3,23 @@
   Converts TestStand ATML XML reports (NATE / CATE 2.0 tester) into one Access .mdb laid out like the
   CATE / EVO result databases, so the dashboard and other tools can read it.
 
+.DESCRIPTION
+  How it works, in order:
+  1. The C# parser below (AtmlParser) is compiled with Add-Type on first use. For one report it reads the
+     TestResults, takes the coil identity from the SelectMode session action (part_description, part_number,
+     File Mode, port), walks every TestGroup, decodes its "Test Configuration" JSON and maps each test group
+     name to a result table (sensitivity -> Sensitivity, multicoil_bias -> MCBiasResults and
+     MCBiasCurrentResults, noise_power_density -> NoiseResults, preamp_short_circuit -> SCPreResults,
+     power_draw / mux_sink -> MuxAuxPSResults, coil_present -> CoilPresentResults, coil_id -> IdentifyCoil).
+     Every run also yields a SourceFiles row; unreadable reports yield a SkippedFiles row.
+  2. The target .mdb is created with ADOX (Jet 4 format, every column TEXT(255), AutoNumber key) when
+     missing; rows are appended with DAO table-type recordsets inside 5000-row transactions.
+  3. Reports already listed in SourceFiles / SkippedFiles are skipped, and a report whose run uuid was
+     already imported from another file (TestStand's TempReport copies) is recorded as a duplicate.
+  4. With -KeepCsv / -DryRun the same rows go to per-table CSVs and an all-tables bundle CSV.
+  5. The database is compacted at the end unless -NoCompact. Progress goes to <Out>.import.log.
+  tools/convert_nate.bat wraps the usual invocations; tools/verify_atml.py and dev/test-nate.js check the output.
+
 .EXAMPLE
   # trial run: first 50 reports into a scratch database
   powershell -ExecutionPolicy Bypass -File tools\atml_to_mdb.ps1 -Source "..\data\NATE CATE 2\DataArchive\FAC\FAC" -Out "..\data\NATE CATE 2\NATE1001_trial.mdb" -Limit 50 -Rebuild
@@ -25,6 +42,7 @@
                       ("#table=<Table>" line before each table's header). Dropping the bundle on the dashboard
                       loads all tables, exactly like the .mdb.
 .PARAMETER NoCompact  Skip the final compact step.
+.PARAMETER CsvDir     Folder for the CSV copies (default: _csv_<name> next to the database).
 
 .NOTES
   Needs only what Windows + Office ship with: .NET Framework (the parser is C# compiled at run time),
@@ -62,8 +80,10 @@ using System.Text;
 using System.Xml;
 using System.Web.Script.Serialization;
 
+// One output row: the target table name and its values in Columns[Table] order (null = field left empty).
 public class AtmlRow { public string Table; public string[] Values; }
 
+// Stateless parser: Parse(path, importedAt) turns one ATML report into AtmlRow objects for every table.
 public static class AtmlParser
 {
     static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
@@ -78,7 +98,9 @@ public static class AtmlParser
     public static readonly HashSet<string> MemoColumns = new HashSet<string>();   // every column is TEXT(255) like the CATE/EVO databases (the dashboard reader has no MEMO support)
     static readonly Dictionary<string, Dictionary<string, int>> Index = new Dictionary<string, Dictionary<string, int>>();
 
+    // Cat(more...): the common identity columns followed by the table-specific ones.
     static string[] Cat(params string[] more) { var l = new List<string>(Common); l.AddRange(more); return l.ToArray(); }
+    // Static initialiser: column layout per table (CATE / EVO order, then Port and RunID) and a name -> index map.
     static AtmlParser()
     {
         Columns["Sensitivity"] = Cat("TestCase", "Channel", "Element", "Measurement", "LSL", "USL", "PassFail", "Units", "Port", "RunID");
@@ -95,12 +117,14 @@ public static class AtmlParser
     }
 
     // ---------------------------------------------------------------- helpers
+    // Converts an ATML ISO timestamp to the CATE TimeDate text form; returns the input unchanged when it does not parse.
     public static string CateDate(string iso)
     {   // 2024-07-09T13:59:45.542 -> 7/9/2024 1:59:45 PM (the CATE TimeDate text form)
         DateTime dt;
         if (DateTime.TryParse(iso, Inv, DateTimeStyles.None, out dt)) return dt.ToString("M/d/yyyy h:mm:ss tt", Inv);
         return iso ?? "";
     }
+    // Maps a tr:Outcome element to PASS / FAIL; other outcomes (Aborted, Terminated ...) use the qualifier or value upper-cased.
     static string Outcome2PF(XmlElement el)
     {
         if (el == null) return "";
@@ -109,6 +133,7 @@ public static class AtmlParser
         if (v == "Failed") return "FAIL";
         return (q.Length > 0 ? q : v).ToUpperInvariant();
     }
+    // Value of a c:Datum: the value attribute when present, else the nested c:Value text; null without a datum.
     static string DatumValue(XmlElement d, XmlNamespaceManager ns)
     {
         if (d == null) return null;
@@ -116,7 +141,9 @@ public static class AtmlParser
         var v = d.SelectSingleNode("c:Value", ns);
         return v == null ? null : v.InnerText.Trim();
     }
+    // Lower / upper limit and expected value of a TestResult, as the text found in the report.
     class Lim { public string lo, hi, expected; }
+    // Reads LimitPair / SingleLimit comparators (GE, GT -> lo; LE, LT -> hi) and the Expected datum of a TestResult.
     static Lim Limits(XmlElement tr, XmlNamespaceManager ns)
     {
         var l = new Lim();
@@ -129,20 +156,25 @@ public static class AtmlParser
         if (exp != null) l.expected = DatumValue(exp, ns);
         return l;
     }
+    // Safe lookup of a key in a JSON object deserialised to Dictionary<string, object>; null when missing or not an object.
     static object Prop(object obj, string name)
     {
         var d = obj as Dictionary<string, object>;
         object v;
         return d != null && d.TryGetValue(name, out v) ? v : null;
     }
+    // Invariant-culture string of a JSON value ("" for null).
     static string S(object o) { return o == null ? "" : Convert.ToString(o, Inv); }
+    // Invariant parse of a number, null when the text is not numeric (e.g. "NA" or missing).
     static double? ToDouble(string s)
     {
         double d;
         if (s != null && double.TryParse(s, NumberStyles.Float, Inv, out d)) return d;
         return null;
     }
+    // Two-decimal invariant text (the form the EVO Noise table uses).
     static string F2(double d) { return d.ToString("F2", Inv); }
+    // Reads the "bias" (else "mux") section of the test configuration and joins its P1 / P2 channel lists.
     static string ChannelOf(object cfg)
     {   // the physical channel(s) biased (else muxed) for this test case; "" when none
         foreach (var k in new[] { "bias", "mux" })
@@ -160,6 +192,7 @@ public static class AtmlParser
         }
         return "";
     }
+    // NetName for power tests: the first entry of the configuration's power list, else the given fallback (TC<n>).
     static string NetOf(object cfg, string fallback)
     {
         var pw = Prop(cfg, "power") as System.Collections.IList;
@@ -170,6 +203,7 @@ public static class AtmlParser
         }
         return fallback;
     }
+    // Builds an AtmlRow from a name -> value map, placing values in the table's column order and truncating to 255 chars.
     static AtmlRow Row(string table, Dictionary<string, string> vals)
     {
         var cols = Columns[table]; var arr = new string[cols.Length];
@@ -182,6 +216,7 @@ public static class AtmlParser
         }
         return new AtmlRow { Table = table, Values = arr };
     }
+    // Formats values as one CSV record with every field quoted and " doubled (the layout the dashboard expects).
     public static string CsvLine(string[] values)
     {
         var sb = new StringBuilder();
@@ -192,16 +227,23 @@ public static class AtmlParser
         }
         return sb.ToString();
     }
+    // Convenience for the PowerShell side: a one-row list holding a SkippedFiles entry for the given file.
     public static List<AtmlRow> SkipRows(string path, string reason, string importedAt)
     {
         return new List<AtmlRow> { Skip(new FileInfo(path), reason, importedAt) };
     }
+    // The SkippedFiles row for a file and a reason.
     static AtmlRow Skip(FileInfo f, string reason, string importedAt)
     {
         return Row("SkippedFiles", new Dictionary<string, string> { { "FileName", f.Name }, { "FilePath", f.FullName }, { "FileSize", f.Length.ToString(Inv) }, { "Reason", reason }, { "ImportedAt", importedAt } });
     }
 
     // ---------------------------------------------------------------- one report -> rows
+    // Parses one report file and returns every row it yields (result tables, one SourceFiles row per
+    // TestResults element, or a SkippedFiles row for empty / malformed files). Two passes per run: the
+    // first collects the test groups with their configuration JSON and learns which physical channel each
+    // element was biased on; the second emits the rows, giving unbiased test cases the channel of their
+    // element. Coil identity falls back to the <PN>_<SN>_..._log.xml file name when the report lacks it.
     public static List<AtmlRow> Parse(string path, string importedAt)
     {
         var rows = new List<AtmlRow>();
@@ -389,12 +431,14 @@ $COLUMNS = [AtmlParser]::Columns
 $MEMO = [AtmlParser]::MemoColumns
 
 # ====================================================================== outputs: database (DAO) and/or CSV copies
+# Log(msg): timestamped line to the console and to <Out>.import.log.
 function Log($msg) { $line = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $msg; Write-Host $line; Add-Content -Path $logPath -Value $line -Encoding UTF8 }
 if (Test-Path $logPath) { Remove-Item $logPath }
 Log "source $Source"
 Log "out    $Out"
 if ($Rebuild -and $writeDb -and (Test-Path $Out)) { Remove-Item $Out; Log "removed existing $Out" }
 
+# $already: file names already imported (skipped on incremental runs); $seenRuns: RunID -> first file that held it.
 $already = @{}
 $seenRuns = @{}          # RunID -> file already imported (TestStand's TempReport_*.xml copies repeat a run saved under its normal name)
 $dbe = $null; $db = $null; $rsets = @{}; $fieldObjs = @{}
@@ -431,6 +475,7 @@ if ($writeDb) {
     if ($already.Count) { Log "database already holds $($already.Count) files; they are skipped" }
   }
 }
+# CSV writers (one per table) when -KeepCsv / -DryRun; headers are written now, rows as they come.
 $writers = @{}
 if ($writeCsv) {
   if (Test-Path $CsvDir) { Remove-Item $CsvDir -Recurse -Force }
@@ -457,6 +502,7 @@ $importedAt = (Get-Date).ToString('M/d/yyyy h:mm:ss tt', $inv)
 $sw = [Diagnostics.Stopwatch]::StartNew()
 $nDone = 0; $nSkipped = 0; $nRows = 0; $txRows = 0
 if ($writeDb) { $dbe.BeginTrans() }
+# Main loop: parse each report, drop duplicate runs, append rows to the recordsets and / or the CSV writers.
 foreach ($f in $files) {
   $nDone++
   if ($nDone % 500 -eq 0 -or $nDone -eq $files.Count) {

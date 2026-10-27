@@ -1,5 +1,12 @@
 // Synthetic checks for run clustering, the first pass yield report and the latest / first run chart filter:
 //   node dev/test-yield.js
+// How it works: a small Sensitivity CSV (plus one MCBias row and one MuxAuxPS row on another machine) is
+// built from the tc() / net() row helpers so every serial exercises one rule of the yield report: retests
+// within / beyond the run gap, a repeated test case starting a new run, dummy serials, cleaned serials
+// (0012 = 12-xyz), NA verdicts judged by the limits, unjudged rows, test kits and the machine filter.
+// The rows are loaded into CATE.model through parse-core, then model.runs(), model.yieldReport() with its
+// options, model.serialList() and the runs=latest/first chart filter are asserted against hand-counted
+// values. Needs no data files. Prints ALL PASSED or N FAILURE(S) (exit code 1).
 const cateParseCore = require('../js/parse-core.js');
 require('../js/ticks.js');
 require('../js/model.js');
@@ -7,18 +14,22 @@ const CATE = globalThis.CATE;
 const core = cateParseCore();
 
 let fails = 0;
+// Assertion helper: deep-equal via JSON (NaN == NaN allowed); counts failures, prints ok / FAIL with both values.
 function eq(a, b, msg) {
   const ok = (Number.isNaN(a) && Number.isNaN(b)) || a === b || JSON.stringify(a) === JSON.stringify(b);
   if (!ok) { fails++; console.error('FAIL', msg, '\n  got     ', a, '\n  expected', b); } else console.log('ok  ', msg);
 }
 
 const HDR = '"CoilName","CoilSN","Mode","TimeDate","TestCase","Channel","Element","Measurement","LSL","USL","PassFail","Units"\n';
+// One Sensitivity CSV row for the given coil, serial, timestamp, test case, value and verdict (Channel 1, Element 1).
 function tc(coil, sn, time, testCase, meas, pf, lsl = '-20', usl = 'NA') {
   return `"${coil}","${sn}","All Modes","${time}","${testCase}","1","1","${meas}","${lsl}","${usl}","${pf}","dB"\n`;
 }
 const MUX_HDR = '"CoilName","CoilSN","Mode","TimeDate","NetName","LSL","Measurement","USL","PassFail","Units"\n';
+// One MuxAuxPS CSV row (NetName table, limits 0.3 .. 0.7 A).
 function net(coil, sn, time, name, meas, pf) { return `"${coil}","${sn}","All Modes","${time}","${name}","0.3","${meas}","0.7","${pf}","A"\n`; }
 
+// Parses CSV text with parse-core and adds the dataset to machine index m; the file name decides the table.
 async function load(m, text, fileName) {
   let ds = null;
   await core.parseFile(new Blob([text]), (msg) => { if (msg.type === 'dataset') ds = msg; if (msg.type === 'error') throw new Error(msg.message); }, { fileName });
@@ -26,6 +37,7 @@ async function load(m, text, fileName) {
   return ds;
 }
 
+// Scenario: build the synthetic data, then check runs, the yield report and the chart run filter.
 (async () => {
   const sens =
     // SN A: run 1 at 09:00 (TC1 fails), run 2 at 09:20 (20 min later, all pass)

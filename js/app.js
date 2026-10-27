@@ -1,4 +1,23 @@
-/* app.js - UI wiring: file slots, date range, generate, viewer (single + library), downloads. */
+/* app.js - UI wiring: file slots, date range, generate, viewer (single + library), downloads, Yield tab.
+ *
+ * This is the dashboard's controller. CATEDASHBOARD.html loads it last, after the other modules (ticks.js,
+ * model.js, chart.js, zip.js, loader.js, parse-core.js, jet-core.js) have attached themselves to
+ * globalThis.CATE, and it runs once as an IIFE: it reads the saved settings from localStorage, wires every
+ * DOM control and renders the initial (empty) views.
+ *
+ * Data flow: dropped files -> loader (CATE.Loader, worker parsing) -> model (columnar store). The loader's
+ * 'dataChanged' event triggers generate(), which calls model.build(resolvedSettings, measurement) to get
+ * state.build: one entry per coil with its chart groups (one group = one run chart: coil x mode x test case
+ * or net, holding the matching rows of every machine). The overview (renderSummary) lists data coverage and
+ * charts by coil; openCoil shows the viewer, where the filters narrow the coil's groups into state.filtered
+ * and either renderSingle (one canvas with a hover tooltip) or renderLibrary (lazy grid of cards) draws them
+ * with chart.render from specs produced by model.chartSpec (memoised in state.specCache). Downloads use
+ * chart.renderToBlob and, for a whole coil, CATE.ZipWriter. The Yield tab calls model.yieldReport for the
+ * first pass yield per coil type and offers an exclude-serials dropdown.
+ *
+ * All UI state lives in the `state` object below; persistent choices live in state.settings and are written
+ * back with saveSettings(). window.cateApp at the end exposes a few entry points for dev/ui-test.html.
+ */
 (function () {
   'use strict';
   var T = CATE.ticks, model = CATE.model, chart = CATE.chart;
@@ -26,11 +45,15 @@
   };
 
   /* ---------------- settings ---------------- */
+  /* Normalise a list of serial numbers for the exclude lists: lower-case, trimmed, unique, blanks removed. */
   function normSerials(list) {                                // lower-case, trimmed, unique, non-empty
     var seen = new Set(), out = [];
     list.forEach(function (v) { var k = String(v).trim().toLowerCase(); if (k && !seen.has(k)) { seen.add(k); out.push(k); } });
     return out;
   }
+  /* Build the settings object: start from the defaults (CATE.DEFAULTS, CATE.OUTLIER_DEFAULTS, ...) and overlay
+   * what is saved in localStorage under STORAGE_KEY, validating each field on its own so a stale or malformed
+   * saved value falls back to its default. A saved blob is only used when it has both start and end. */
   function loadSettings() {
     var s = { start: CATE.DEFAULTS.start, end: CATE.DEFAULTS.end,
               overrides: CATE.DEFAULTS.overrides.map(function (o) { return { coil: o.coil, start: o.start, end: o.end }; }),
@@ -61,8 +84,12 @@
     } catch (e) { /* ignore */ }
     return s;
   }
+  /* Persist state.settings to localStorage (silently skipped when storage is unavailable). */
   function saveSettings() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state.settings)); } catch (e) { /* ignore */ } }
 
+  /* Turn the string settings into what model.build / model.yieldReport need: start / end as UTC day timestamps
+   * and the overrides with parsed dates ('today' or an empty end = today). Returns {error: msg} when a date is
+   * invalid or a range is reversed, otherwise {start, end, overrides}. */
   function resolvedSettings() {
     var s = state.settings;
     var start = T.parseIsoDate(s.start), end = T.parseIsoDate(s.end);
@@ -81,8 +108,12 @@
   }
 
   /* ---------------- helpers ---------------- */
+  /* fmtBytes / fmtInt: human-readable sizes (GB / MB / KB / B) and thousands-separated integers for the UI. */
   function fmtBytes(b) { if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB'; if (b >= 1e6) return (b / 1e6).toFixed(1) + ' MB'; if (b >= 1e3) return (b / 1e3).toFixed(0) + ' KB'; return b + ' B'; }
   function fmtInt(n) { return Number(n).toLocaleString('en-US'); }
+  /* Tiny DOM builder: el(tag, attrs, children). attrs keys: 'class' -> className, 'text' -> textContent,
+   * 'html' -> innerHTML, 'onX' -> addEventListener('X'), anything else -> setAttribute. children may be
+   * strings (text nodes), elements or falsy entries (skipped). Returns the element. */
   function el(tag, attrs, children) {
     var e = document.createElement(tag);
     if (attrs) Object.keys(attrs).forEach(function (k) {
@@ -95,6 +126,8 @@
     (children || []).forEach(function (c) { if (c) e.appendChild(typeof c === 'string' ? document.createTextNode(c) : c); });
     return e;
   }
+  /* Trigger a browser download of `blob` as file `name` through a temporary <a download>; the object URL is
+   * revoked and the anchor removed after 2 s. */
   function download(blob, name) {
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob); a.download = name;
@@ -102,9 +135,16 @@
     setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
   }
   var debounceTimers = {};
+  /* Run fn after ms of quiet time, one timer per key (a newer call with the same key cancels the older one).
+   * Used to coalesce generate() calls while files load or settings change. */
   function debounce(key, fn, ms) { clearTimeout(debounceTimers[key]); debounceTimers[key] = setTimeout(fn, ms); }
 
   /* ---------------- file slots UI ---------------- */
+  /* Rebuild the files table (step 1 panel): one row per machine slot showing the loaded file name(s), a
+   * progress bar with rate / ETA while parsing, an 'indexing' bar, or the error; then a one-line summary
+   * (table count and date span) with the per-measurement details (rows, span, dropped rows, encoding) that
+   * show on hover or stay open when the row is clicked (state.pinnedSlots), table errors, the queue length,
+   * the kept row count and a clear button. Reads loader.slots directly; called on every 'slot' event. */
   function renderFileTable() {
     var tb = $('fileTable').querySelector('tbody');
     tb.innerHTML = '';
@@ -167,6 +207,8 @@
     });
   }
 
+  /* Show or hide the global progress bar: sums bytesDone / bytesTotal over the busy slots and names them in
+   * the label. Hidden when nothing is parsing or indexing. */
   function renderGlobalProgress() {
     var busy = loader.slots.filter(function (s) { return s.status === 'parsing' || s.status === 'indexing'; });
     var gp = $('globalProgress');
@@ -179,6 +221,8 @@
     $('globalProgressLabel').textContent = 'Processing ' + busy.length + ' of ' + loadedSlots + ' file' + (loadedSlots === 1 ? '' : 's') + ' (' + busy.map(function (s) { return s.name; }).join(', ') + ')';
   }
 
+  /* Update the one-line status under the header: machines loaded, kept rows, the chart count of the current
+   * build and a "loading more" hint while the loader is busy. */
   function renderStatus() {
     var loaded = loader.slots.filter(function (s) { return s.status === 'done'; });
     var busy = loader.isBusy();
@@ -193,6 +237,9 @@
     $('globalStatus').textContent = txt;
   }
 
+  /* Loader events. 'slot' fires on every progress / status change (cheap re-render of the file UI).
+   * 'dataChanged' fires when the model gained or lost a dataset: refresh the controls that list data and
+   * rebuild the charts (debounced, since the datasets of one .mdb arrive in quick succession). */
   loader.on('slot', function () { renderFileTable(); renderGlobalProgress(); renderStatus(); renderPartialBanner(); });
   loader.on('dataChanged', function () {
     renderFileTable(); renderGlobalProgress();
@@ -206,6 +253,9 @@
   });
 
   /* ---------------- drag & drop ---------------- */
+  /* Drag & drop: the drop zone gets an 'over' highlight; dropping anywhere on the page (not only on the zone)
+   * loads the files, and the browser's default navigation on drop is suppressed. The hidden file input is
+   * reset after use so the same file can be picked again. */
   var dz = $('dropZone');
   ['dragenter', 'dragover'].forEach(function (ev) { dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.add('over'); }); });
   ['dragleave', 'drop'].forEach(function (ev) { dz.addEventListener(ev, function (e) { e.preventDefault(); dz.classList.remove('over'); }); });
@@ -213,21 +263,27 @@
   document.addEventListener('dragover', function (e) { e.preventDefault(); });
   document.addEventListener('drop', function (e) { e.preventDefault(); if (e.target !== dz && !dz.contains(e.target)) handleFiles(e.dataTransfer.files); });
   $('fileInput').addEventListener('change', function (e) { handleFiles(e.target.files); e.target.value = ''; });
+  /* Hand a FileList to the loader and report the files it could not place (wrong extension or no machine name
+   * in the file name). Entry point for drop, the file picker and the dev hook. */
   function handleFiles(files) {
     var r = loader.addFiles(files);
     $('ignoredFiles').textContent = r.ignored.length ? 'Ignored (not a .csv/.mdb, or no machine name CATE1001/1003/1006/1007, EVO1001/1002 or NATE1001 in the file name): ' + r.ignored.join(', ') : '';
   }
 
   /* ---------------- date range UI ---------------- */
+  /* Push the saved start / end dates into the date inputs and redraw the overrides table. */
   function syncRangeInputs() {
     $('startDate').value = state.settings.start;
     $('endDate').value = state.settings.end;
     renderOverrides();
   }
+  /* Editing a date or clicking a preset turns off rangeAuto: the range stops following the loaded data. */
   $('startDate').addEventListener('change', function () { state.rangeAuto = false; state.settings.start = this.value; saveSettings(); debounce('gen', generate, 150); });
   $('endDate').addEventListener('change', function () { state.rangeAuto = false; state.settings.end = this.value; saveSettings(); debounce('gen', generate, 150); });
   document.querySelectorAll('[data-preset]').forEach(function (b) { b.addEventListener('click', function () { state.rangeAuto = false; applyPreset(b.getAttribute('data-preset'), false); }); });
 
+  /* Date span of the loaded data for the current measurement (or of any measurement when it has none), both
+   * ends floored to UTC midnight. Returns null when nothing is loaded. */
   function dataExtent() {
     var ext = model.extent(state.settings.measurement) || model.extent();
     if (!ext) return null;
@@ -235,6 +291,9 @@
   }
 
   /* ---------------- measurement select ---------------- */
+  /* Rebuild the measurement (data type) <select>. Measurements without data are disabled and labelled; when a
+   * coil is open, measurements that coil has no rows for are labelled "(none for this coil)". If the
+   * remembered measurement has no data at all, switch to the first one that has and reset the filters. */
   function populateMeasurementSelect() {
     var sel = $('fMeasure'), cur = state.settings.measurement;
     // The remembered measurement may not exist in the data now loaded (e.g. Noise remembered from an EVO
@@ -262,7 +321,9 @@
     for (var i = 0; i < list.length; i++) if (list[i].name === name) return true;
     return false;
   }
-  /* Why the open coil cannot be shown for measurement k: null when it can, otherwise a message. */
+  /* Why the open coil cannot be shown for measurement k: null when it can, otherwise a message. Checks first
+   * that the coil has rows for k at all, then runs model.buildCoil with the current date range; when that gives
+   * no chart groups the message quotes the coil's actual date span for k so the user can widen the range. */
   function coilMeasurementProblem(name, k) {
     var label = CATE.MEASUREMENTS[k].label;
     var list = model.coilList(k), entry = null;
@@ -278,12 +339,16 @@
     return name + ' has no ' + label + ' rows between ' + state.settings.start + ' and ' + state.settings.end + ' (its ' + label + ' data spans ' + T.formatDate(mn) + ' – ' + T.formatDate(mx) + '). Widen the date range on the left to see them.';
   }
   var measureNoteTimer = null;
+  /* Show a note under the measurement select (auto-hidden after 8 s); an empty message hides it at once. */
   function showMeasureNote(msg) {
     var b = $('measureNote');
     b.textContent = msg; b.hidden = !msg;
     if (measureNoteTimer) clearTimeout(measureNoteTimer);
     if (msg) measureNoteTimer = setTimeout(function () { b.hidden = true; }, 8000);
   }
+  /* Measurement select: when a coil is open and has nothing to show for the new measurement, revert the pick
+   * and explain why. Otherwise reset the spec cache and the per-coil filters, let the range follow the new
+   * data when it is still automatic, and rebuild. */
   $('fMeasure').addEventListener('change', function () {
     var k = $('fMeasure').value;
     if (!CATE.MEASUREMENTS[k]) return;
@@ -300,6 +365,9 @@
     if (state.rangeAuto && model.hasData(k)) applyPreset('last7', true);
     generate();
   });
+  /* Set the date range relative to the loaded data: 'last7' / 'last30' end on the last data day, 'ytd' starts
+   * on Jan 1 of that year, anything else ('all') spans the whole extent. silent suppresses the "load data
+   * first" error (used when the range follows the data automatically). Saves, syncs the inputs, regenerates. */
   function applyPreset(name, silent) {
     var ext = dataExtent();
     if (!ext) { if (!silent) showRangeError('Load data first.'); return; }
@@ -311,8 +379,11 @@
     state.settings.start = T.isoDate(start); state.settings.end = T.isoDate(end);
     saveSettings(); syncRangeInputs(); debounce('gen', generate, 50);
   }
+  /* Show (or clear, with an empty message) the error line under the date range controls. */
   function showRangeError(msg) { var e = $('rangeError'); e.hidden = !msg; e.textContent = msg || ''; }
 
+  /* Redraw the per-coil range overrides table from state.settings.overrides, with a remove button per row,
+   * and the count badge on the collapsible box. */
   function renderOverrides() {
     var tb = $('overrideTable').querySelector('tbody');
     tb.innerHTML = '';
@@ -325,6 +396,8 @@
     });
     $('overrideCount').textContent = state.settings.overrides.length;
   }
+  /* Add-override button: validates coil and start, replaces any existing override for that coil, clears the
+   * inputs, opens the box and regenerates. */
   $('ovAdd').addEventListener('click', function () {
     var coil = $('ovCoil').value.trim(), start = $('ovStart').value, end = $('ovEnd').value;
     if (!coil) { showRangeError('Override needs a coil: pick one from the list (load CSV files first).'); return; }
@@ -348,6 +421,10 @@
 
   /* ---------------- generate ---------------- */
   $('generateBtn').addEventListener('click', generate);
+  /* Rebuild everything that depends on the data, the date range and the measurement: state.build =
+   * model.build(...), then the coil list, overview, status and - when a coil is open - the viewer in place
+   * (keeping its position), plus the Yield tab when it is showing. With no data the views are cleared.
+   * A date-range error is shown instead of building. */
   function generate() {
     if (!model.hasData()) { state.build = null; renderCoilList(); renderSummary(); renderStatus(); if (state.tab === 'yield') renderYield(); return; }
     var rs = resolvedSettings();
@@ -364,6 +441,9 @@
   }
 
   $('coilSearch').addEventListener('input', renderCoilList);
+  /* Redraw the coil list in the left panel from state.build, filtered by the search box (case-insensitive
+   * substring). Coils without chart groups in range are greyed and not clickable; the active coil is
+   * highlighted. Updates the "n of m coils have data" summary line. */
   function renderCoilList() {
     var ul = $('coilList'); ul.innerHTML = '';
     if (!state.build) { $('coilSummary').textContent = ''; return; }
@@ -382,6 +462,11 @@
   }
 
   /* ---------------- summary view ---------------- */
+  /* Render the overview (summary view): the Data coverage table (one row per machine: files, loaded tables as
+   * chips, rows kept / dropped, first and last date; clicking a row selects that machine so the list below
+   * only shows its coils / charts) and the Charts by coil table for the current build with data-type chips,
+   * CSV export buttons and explanatory messages when nothing falls in the date range. With a machine
+   * selected, chart and row counts are restricted to the groups that have rows for that machine. */
   function renderSummary() {
     var cov = $('coverage'); cov.innerHTML = '';
     cov.appendChild(el('h3', { text: 'Data coverage' }));
@@ -494,16 +579,23 @@
   }
 
   /* ---------------- viewer ---------------- */
+  /* The build entry of the selected coil, or null when there is no build or no selection. */
   function currentCoil() {
     if (!state.build || !state.selectedCoil) return null;
     for (var i = 0; i < state.build.coils.length; i++) if (state.build.coils[i].name === state.selectedCoil) return state.build.coils[i];
     return null;
   }
+  /* Index into CATE.MACHINES of the machine filter, -1 for "all machines". */
   function machineIndex() { return state.filters.machine ? CATE.MACHINES.indexOf(state.filters.machine) : -1; }
+  /* Chart options for model.chartSpec from the current settings and filters: outlier handling, stats band,
+   * port filter and the Runs filter (all / latest / first run per coil). */
   function chartOpts() {
     var s = state.settings;
     return { outlierMode: s.outlierMode, k: s.outlierK, stats: s.stats, statsOutliers: s.statsOutliers ? 'include' : 'exclude', port: state.filters.port || null, runs: s.runs || 'all' };
   }
+  /* Chart spec for group g of `coil`, memoised in state.specCache under a key that includes every option that
+   * changes the drawn points (machine, outlier mode / k, stats, port, runs). The cache is reset whenever the
+   * build, the measurement or the chart options change. */
   function specFor(coil, g) {
     var mi = machineIndex(), o = chartOpts();
     var key = g.measurement + '#' + g.key + '#' + mi + '#' + o.outlierMode + '#' + o.k + '#' + (o.stats ? 1 : 0) + '#' + o.statsOutliers + '#' + (o.port || '') + '#' + o.runs;
@@ -511,6 +603,7 @@
     if (!s) { s = model.chartSpec(coil, g, mi, o); state.specCache.set(key, s); }
     return s;
   }
+  /* Push the saved chart options (outlier mode / k, stats, stats-with-outliers, runs) into their controls. */
   function syncOutlierControls() {
     $('fOutliers').value = state.settings.outlierMode;
     $('fK').value = state.settings.outlierK;
@@ -520,6 +613,8 @@
     // the toggle only has an effect in Flag mode (Exclude drops the points, Off never flags any)
     $('fStatsOut').disabled = state.settings.outlierMode !== 'flag' || !state.settings.stats;
   }
+  /* Read the chart option controls back into settings (k clamped to 1..20, runs to a known value), save, drop
+   * the spec cache and redraw the open viewer in its current mode. */
   function onChartOptsChanged() {
     var mode = $('fOutliers').value, k = parseFloat($('fK').value);
     if (!(k >= 1 && k <= 20)) { k = state.settings.outlierK; $('fK').value = k; }
@@ -533,7 +628,10 @@
     if (state.viewMode === 'single') renderSingle(); else renderLibrary();
   }
   ['fOutliers', 'fK', 'fStats', 'fStatsOut', 'fRuns'].forEach(function (id) { $(id).addEventListener('change', onChartOptsChanged); });
+  /* True while any file is still parsing or indexing; charts and downloads then carry a PARTIAL DATA mark. */
   function isPartial() { return loader.isBusy(); }
+  /* Show the partial-data banner in the viewer listing the machines still loading (with progress) and disable
+   * the zip download meanwhile; hidden when nothing is loading or the viewer is closed. */
   function renderPartialBanner() {
     var b = $('partialBanner');
     if (!isPartial() || $('viewer').hidden) { b.hidden = true; return; }
@@ -543,6 +641,10 @@
     $('downloadAllBtn').disabled = true;
   }
 
+  /* Open the viewer for coil `name`. keepPosition (used by generate() after a rebuild) keeps the filters and
+   * tries to stay on the same chart (state.currentKey); otherwise the filters are reset. Falls back to the
+   * overview when the coil is not in the current build. Switches to the Charts tab if needed, fills the
+   * header line, rebuilds the filter selects from the coil's groups and applies them. */
   function openCoil(name, keepPosition) {
     var prevKey = keepPosition ? state.currentKey : null;
     state.selectedCoil = name;
@@ -561,6 +663,7 @@
     renderPartialBanner();
   }
   $('backBtn').addEventListener('click', showSummary);
+  /* Close the viewer and show the overview (Back button). Clears the selection and any measurement note. */
   function showSummary() {
     state.selectedCoil = null; state.currentKey = null;
     if (state.tab !== 'charts') showTab('charts', true);
@@ -569,6 +672,10 @@
     renderCoilList();
   }
 
+  /* Fill the viewer's filter selects from the coil's groups: machines that have rows for this coil, modes,
+   * test cases (or nets for measurements keyed by net, e.g. Noise) and ports, keeping the current pick when
+   * still valid. The test-case and net filters are swapped according to the measurement's keyKind; the port
+   * filter only appears when the coil was tested on more than one port (EVO data). */
   function populateFilters(coil) {
     var sets = { mode: new Set(), tc: new Set(), net: new Set(), port: new Set() };
     var present = CATE.MACHINES.map(function () { return false; });
@@ -591,12 +698,14 @@
     $('tcFilter').hidden = isNet; $('netFilter').hidden = !isNet;
     $('portFilter').hidden = ports.length < 2;           // only EVO data carries ports; shown when a coil was tested on more than one
   }
+  /* Replace the options of a <select> with an "all" entry followed by `values`; selects `current` if present. */
   function fillSelect(sel, values, current, allLabel) {
     sel.innerHTML = '';
     sel.appendChild(el('option', { value: '', text: allLabel }));
     values.forEach(function (v) { sel.appendChild(el('option', { value: v, text: v })); });
     sel.value = values.indexOf(current) >= 0 ? current : '';
   }
+  /* Any filter change re-applies the filters, trying to stay on the current chart. */
   ['fMachine', 'fMode', 'fTc', 'fNet', 'fPort'].forEach(function (id) {
     $(id).addEventListener('change', function () {
       state.filters = { machine: $('fMachine').value, mode: $('fMode').value, tc: $('fTc').value, net: $('fNet').value, port: $('fPort').value };
@@ -604,12 +713,16 @@
       applyFilters(state.currentKey);
     });
   });
+  /* Show the channel / element read-outs of group g (single view only; hidden for net-keyed measurements). */
   function updateReadouts(g) {
     var isNet = CATE.MEASUREMENTS[state.settings.measurement].keyKind === 'net';
     $('fChanValue').textContent = g ? g.chan : '—';
     $('fElemValue').textContent = g ? g.elem : '—';
     $('chanReadout').hidden = $('elemReadout').hidden = (state.viewMode !== 'single') || isNet;
   }
+  /* Compute state.filtered from the open coil's groups and the machine / mode / test case / net / port filters,
+   * update the "n of m charts match" label, position on the group whose key equals preferKey (else the first)
+   * and redraw the current view mode. */
   function applyFilters(preferKey) {
     var coil = currentCoil(); if (!coil) return;
     var f = state.filters, mi = machineIndex();
@@ -627,6 +740,7 @@
   /* view mode toggle */
   $('modeSingle').addEventListener('click', function () { setViewMode('single'); });
   $('modeLibrary').addEventListener('click', function () { setViewMode('library'); });
+  /* Switch between the single-chart view and the library grid, updating the toggle buttons and redrawing. */
   function setViewMode(mode) {
     state.viewMode = mode;
     $('modeSingle').classList.toggle('active', mode === 'single');
@@ -637,6 +751,10 @@
   }
 
   /* single chart */
+  /* Draw the chart at state.index of state.filtered on the main canvas: clamps the index, updates the position
+   * label, caption (group caption, machine, runs filter, output file name, outlier summary), read-outs and
+   * the prev / next buttons, then calls chart.render with the spec from specFor, sized to the canvas wrap.
+   * Keeps the render info and spec for the hover tooltip. With nothing to show the canvas is cleared. */
   function renderSingle() {
     var coil = currentCoil();
     var n = state.filtered.length;
@@ -668,6 +786,7 @@
     state.currentSpec = spec;
     $('tooltip').hidden = true;
   }
+  /* Move the single view by delta charts (clamped to the filtered list). */
   function step(delta) {
     var n = state.filtered.length; if (!n) return;
     var i = Math.min(n - 1, Math.max(0, state.index + delta));
@@ -676,6 +795,7 @@
   }
   $('prevBtn').addEventListener('click', function () { step(-1); });
   $('nextBtn').addEventListener('click', function () { step(1); });
+  /* Keyboard navigation in the single view: arrows step, Home / End jump; ignored while typing in a control. */
   document.addEventListener('keydown', function (e) {
     if ($('viewer').hidden || state.viewMode !== 'single') return;
     var t = e.target; if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' || t.tagName === 'TEXTAREA')) return;
@@ -684,11 +804,17 @@
     else if (e.key === 'Home') { state.index = 0; renderSingle(); e.preventDefault(); }
     else if (e.key === 'End') { state.index = state.filtered.length - 1; renderSingle(); e.preventDefault(); }
   });
+  /* Re-render the single chart when the window is resized (debounced). */
   window.addEventListener('resize', function () { debounce('resize', function () { if (!$('viewer').hidden && state.viewMode === 'single') renderSingle(); }, 150); });
 
   /* hover tooltip */
   var cvMain = $('mainCanvas');
-  /* Show the tooltip for the point nearest to canvas-relative CSS position (cx, cy). Returns the hit or null. */
+  /* Show the tooltip for the point nearest to canvas-relative CSS position (cx, cy). Returns the hit or null.
+   * Uses chart.hitTest on the last render info (9 px radius), then model.rowInfo to read the row's machine,
+   * port, serial number, time, value, limits, pass / fail and the measurement's extra columns. Adds an
+   * outlier explanation (deviation in MAD units) when the point is flagged and lists the points stacked at
+   * the same spot. Placed to the right of the marker, flipped left when it would overflow, then clamped
+   * inside the canvas wrap. */
   function showTooltipAt(cx, cy) {
     var tip = $('tooltip');
     if (!state.renderInfo || !state.currentSpec) { tip.hidden = true; return null; }
@@ -743,6 +869,7 @@
   cvMain.addEventListener('mouseleave', function () { $('tooltip').hidden = true; });
 
   /* download single */
+  /* Download the current chart as a PNG (3900 px wide) named <coil>__<mode>__<file>. */
   $('downloadBtn').addEventListener('click', function () {
     var coil = currentCoil(); if (!coil || !state.filtered.length) return;
     var g = state.filtered[state.index];
@@ -753,6 +880,10 @@
 
   /* library */
   var observer = null, renderQueue = [], queueScheduled = false;
+  /* Build the library grid: one card (canvas + caption) per filtered group. Cards are drawn lazily: an
+   * IntersectionObserver (600 px margin around the scrolling .main) queues cards as they come into view and
+   * frees the canvas bitmap (width / height = 0) of cards that scroll away, so thousands of charts stay
+   * cheap. Clicking a card opens it in the single view. */
   function renderLibrary() {
     var grid = $('libraryGrid'); grid.innerHTML = '';
     if (observer) { observer.disconnect(); }
@@ -774,6 +905,8 @@
       observer.observe(card);
     });
   }
+  /* Drain the library render queue in batches of 4 cards per macrotask so the page stays responsive; cards
+   * already rendered or removed from the DOM are skipped. Reschedules itself while work remains. */
   function scheduleQueue() {
     if (queueScheduled) return;
     queueScheduled = true;
@@ -795,6 +928,9 @@
   }
 
   /* download all (zip) */
+  /* Download all (zip): render every filtered group (or every group of the coil when nothing is filtered) to a
+   * PNG one at a time, adding each to a CATE.ZipWriter under <coil>/<mode>/<file>, behind a progress modal
+   * that can be cancelled (state.zipCancel). Chaining through setTimeout keeps the UI responsive. */
   $('downloadAllBtn').addEventListener('click', function () {
     var coil = currentCoil(); if (!coil) return;
     var groups = state.filtered.length ? state.filtered : coil.groups;
@@ -802,6 +938,7 @@
     state.zipCancel = false;
     $('zipModal').hidden = false; $('zipTitle').textContent = 'Rendering ' + groups.length + ' charts for ' + coil.name;
     var i = 0;
+    /* Render group i, add it to the zip and continue with i + 1; when done, pack and download the zip. */
     function next() {
       if (state.zipCancel) { $('zipModal').hidden = true; return; }
       if (i >= groups.length) {
@@ -841,6 +978,9 @@
   }
 
   /* ---------------- yield ---------------- */
+  /* Push the yield settings into the Yield tab controls: run gap, test-kit toggle, the exclude button label
+   * (count of excluded serials: those in the data matched by the predicate plus hand-ticked ones not in the
+   * data), the rule checkbox and the machine select (loaded machines only; an invalid saved pick is cleared). */
   function syncYieldControls() {
     var s = state.settings;
     $('yGap').value = s.yieldGap; $('yTestKits').checked = !!s.yieldTestKits;
@@ -857,6 +997,8 @@
     fillSelect(sel, machines, s.yieldMachine, 'All machines');
     if (machines.indexOf(s.yieldMachine) < 0) s.yieldMachine = '';
   }
+  /* Read the gap (clamped to 1..1440 min), test-kit and machine controls into settings, save, refresh the open
+   * exclude list (run counts depend on the gap) and re-render the Yield tab. */
   function onYieldOptsChanged() {
     var s = state.settings;
     var gap = parseFloat($('yGap').value); if (!(gap >= 1 && gap <= 1440)) { gap = s.yieldGap; $('yGap').value = gap; }
@@ -866,6 +1008,8 @@
     renderYield();
   }
   ['yGap', 'yTestKits', 'yMachine'].forEach(function (id) { $(id).addEventListener('change', onYieldOptsChanged); });
+  /* Options for model.yieldReport: gap in ms, machine index (-1 = all), test-kit inclusion and the exclude
+   * predicate. */
   function yieldOptions() {
     var s = state.settings;
     return { gapMs: s.yieldGap * 60000, machine: s.yieldMachine ? CATE.MACHINES.indexOf(s.yieldMachine) : -1, includeTestKits: !!s.yieldTestKits, excludeSn: excludePredicate(), error: '' };
@@ -876,10 +1020,15 @@
    * contains test / tst / eval, or not in the production format) applies and it was not unticked by hand (yieldExcludeOff).
    * Hand-ticked serials are kept even when the loaded files do not contain them (shown struck through). */
   var EXCLUDE_LIST_MAX = 300, excludeListVersion = -1;
+  /* Build the serial-number predicate used by the report and the list: sn -> true when it is excluded (ticked
+   * by hand, or matched by the default rule and not unticked). Compares lower-cased. */
   function excludePredicate() {
     var s = state.settings, on = new Set(s.yieldExcludeOn), off = new Set(s.yieldExcludeOff), rule = !!s.yieldExcludeRule;
     return function (sn) { var k = sn.toLowerCase(); return on.has(k) || (rule && !off.has(k) && CATE.isDummySerial(sn)); };
   }
+  /* Tick / untick one serial from the dropdown. Keeps the two lists minimal: a serial the rule already covers
+   * is not added to yieldExcludeOn, and unticking goes into yieldExcludeOff only when the rule would otherwise
+   * exclude it. Saves and re-renders the Yield tab. */
   function setExcluded(sn, on) {
     var s = state.settings, k = sn.toLowerCase(), byRule = !!s.yieldExcludeRule && CATE.isDummySerial(sn);
     function drop(arr, v) { var i = arr.indexOf(v); if (i >= 0) arr.splice(i, 1); }
@@ -888,6 +1037,11 @@
     saveSettings();
     renderYield();                                            // refreshes the button label too; the open list is left as it is
   }
+  /* (Re)build the exclude dropdown's list: every serial from model.serialList (with run / failure / coil counts
+   * for the current gap) plus hand-ticked serials missing from the data, filtered by the search box, ticked
+   * ones first, capped at EXCLUDE_LIST_MAX entries. Each row has a checkbox wired to setExcluded and a 'rule'
+   * tag when the default rule ticked it. Remembers model.version so renderYield can refresh the list when
+   * more files arrive while it is open. */
   function buildExcludeList() {
     var list = $('yExcludeList'), note = $('yExcludeNote'), q = $('yExcludeSearch').value.trim().toLowerCase();
     var s = state.settings, pred = excludePredicate(), gapMs = s.yieldGap * 60000;
@@ -915,6 +1069,7 @@
     note.textContent = rows.length > EXCLUDE_LIST_MAX ? 'Showing ' + EXCLUDE_LIST_MAX + ' of ' + fmtInt(rows.length) + ' serials · type to narrow the list' :
       fmtInt(rows.length) + ' serial' + (rows.length === 1 ? '' : 's') + (q ? ' match' : '');
   }
+  /* Open or close the exclude dropdown panel; opening rebuilds the list and focuses the search box. */
   function openExcludeDd(open) {
     var panel = $('yExcludePanel');
     if (open === !panel.hidden) return;
@@ -923,12 +1078,16 @@
   }
   $('yExcludeBtn').addEventListener('click', function () { openExcludeDd($('yExcludePanel').hidden); });
   $('yExcludeSearch').addEventListener('input', buildExcludeList);
+  /* Set the rule flag and both hand lists at once (rule checkbox, Reset to default, Clear all, dev hook). */
   function setExcludeRule(rule, on, off) { var s = state.settings; s.yieldExcludeRule = rule; s.yieldExcludeOn = on; s.yieldExcludeOff = off; saveSettings(); if (!$('yExcludePanel').hidden) buildExcludeList(); renderYield(); }
   $('yExcludeRule').addEventListener('change', function () { setExcludeRule(this.checked, state.settings.yieldExcludeOn, state.settings.yieldExcludeOff); });
   $('yExcludeReset').addEventListener('click', function () { setExcludeRule(true, [], []); });
   $('yExcludeClear').addEventListener('click', function () { setExcludeRule(false, [], []); });
+  /* Clicking outside the dropdown or pressing Escape closes it. */
   document.addEventListener('click', function (e) { if (!$('yExcludeDd').contains(e.target)) openExcludeDd(false); });
   document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && !$('yExcludePanel').hidden) { openExcludeDd(false); $('yExcludeBtn').focus(); } });
+  /* fmtPct: percentage with one decimal, a dash for NaN. pctBar: an inline bar whose fill is coloured low
+   * (< 70 %) or mid (< 90 %). */
   function fmtPct(v) { return v === v ? v.toFixed(1) + ' %' : '—'; }
   function pctBar(v) {
     var wrap = el('span', { class: 'pbar', title: fmtPct(v) });
@@ -936,6 +1095,12 @@
     return wrap;
   }
   var yieldReport = null;
+  /* Render the Yield tab (no-op while hidden): sync the controls, compute model.yieldReport for the current
+   * date range / overrides and yield options, then draw the intro sentence, a note about loaded machines that
+   * contribute no first run in range, the summary tiles (coil types, coils tested, first pass yield, final
+   * yield, retested, runs) and the per-coil-type table. Each coil row toggles a detail row (state.yieldOpen)
+   * with failures by table, by machine and the top failing tests, plus a button to open its run charts.
+   * The report is kept in yieldReport for the CSV export. */
   function renderYield() {
     if ($('yieldView').hidden) return;
     syncYieldControls();
@@ -986,12 +1151,14 @@
       el('th', { text: 'First pass yield' }), el('th', { class: 'num', text: 'Retested' }), el('th', { text: 'Final yield' }),
       el('th', { class: 'num', text: 'Runs' }), el('th', { text: 'First-run failure rate by table', title: 'Share of first runs that failed each result table; open the row for the counts' })])]));
     var tb = el('tbody');
+    /* Cell with one chip per result table that had first-run failures, worst failure rate first. */
     function failChips(a) {
       var td = el('td');
       a.byMeas.filter(function (x) { return x.failed > 0; }).sort(function (x, y) { return y.failed / y.judged - x.failed / x.judged || y.failed - x.failed; })
         .forEach(function (x) { td.appendChild(el('span', { class: 'fail-chip', title: x.failed + ' of ' + x.judged + ' first runs failed ' + x.label, text: x.label + ' ' + (x.failed / x.judged * 100).toFixed(1) + ' %' })); });
       return td;
     }
+    /* One table row for an aggregate a (the total or one coil type); cls 'coil-row' adds the expand caret. */
     function mainRow(a, cls) {
       var isOpen = !!state.yieldOpen[a.coil];
       var tr = el('tr', { class: cls }, [
@@ -1006,6 +1173,8 @@
       if (isOpen) tr.classList.add('open');
       return tr;
     }
+    /* Expanded detail row for coil type a: three small tables (by result table, by machine, top failing tests)
+     * and an "Open run charts" button. */
     function detailRow(a) {
       var byMeas = el('table'); byMeas.appendChild(el('thead', null, [el('tr', null, [el('th', { text: 'Table' }), el('th', { class: 'num', text: 'First runs judged' }), el('th', { class: 'num', text: 'Failed' }), el('th', { class: 'num', text: 'Fail %' })])]));
       var b1 = el('tbody'); a.byMeas.forEach(function (x) { b1.appendChild(el('tr', null, [el('td', { text: x.label }), el('td', { class: 'num', text: fmtInt(x.judged) }), el('td', { class: 'num', text: fmtInt(x.failed) }), el('td', { class: 'num', text: (x.failed / x.judged * 100).toFixed(1) })])); }); byMeas.appendChild(b1);
@@ -1032,6 +1201,7 @@
     });
     table.appendChild(tb); tbl.appendChild(table);
   }
+  /* Export the yield report (one row per coil type plus the total) as CSV. */
   $('yExport').addEventListener('click', function () {
     if (!yieldReport) return;
     var rows = yieldReport.coils.concat([yieldReport.total]).map(function (a) {

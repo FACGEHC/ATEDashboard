@@ -7,6 +7,15 @@
  * also calls it directly on the main thread as a fallback. Everything it needs
  * (TextDecoder, Blob.slice, typed arrays, Map) is available in both contexts.
  * The .mdb path receives a cateJetCore() instance through opts.jet.
+ *
+ * How it works: parseFile() reads a CSV File/Blob in 8 MB chunks, decodes them (UTF-8, falling back
+ * to windows-1252), runs the scan() CSV state machine over each chunk and feeds every record to a
+ * RecordSink. parseMdb() does the same for the result tables of an Access .mdb using the Jet reader.
+ * The RecordSink recognises the table from its header (KEY_TC / KEY_NET / KEY_LINE / KEY_NOISE),
+ * validates and normalises each row (TimeDate -> epoch ms, Measurement -> number, PassFail -> pf)
+ * and appends it to growable typed-array columns plus string dictionaries. finish() packs those
+ * into one transferable 'dataset' message per table, which loader.js hands to model.js for charting
+ * and the first pass yield report. The exported helpers are also exercised by dev/test-*.js.
  */
 function cateParseCore() {
   'use strict';
@@ -66,11 +75,16 @@ function cateParseCore() {
   }
 
   var DIM = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  /* Gregorian leap-year test, used to reject 29 Feb in non-leap years. */
   function isLeap(y) { return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
 
   // Strict "M/D/YYYY h:mm:ss AM|PM" -> epoch ms (naive, treated as UTC). NaN on failure.
+  // readInt() advances the shared cursor i over up to maxDigits digits; each field is then checked
+  // for its range and for the exact separator that must follow (/, /, space, :, :, space). Hours are
+  // a 12-hour clock (1-12) converted with the AM/PM suffix; the string must end right after the suffix.
   function parseDate(s) {
     var n = s.length, i = 0, c;
+    /* Reads a run of digits at cursor i; -1 when there are none or more than maxDigits. */
     function readInt(maxDigits) {
       var v = 0, k = 0;
       while (i < n) {
@@ -100,6 +114,7 @@ function cateParseCore() {
 
   /* ---------- numbers ---------- */
 
+  /* Numeric field: '' and the pandas NA tokens -> NaN, anything else via Number() (NaN when not numeric). */
   function parseNum(s) {
     if (s === '' || NA_TOKENS[s] === true) return NaN;
     return Number(s);                       // Number('abc') === NaN, '' handled above
@@ -107,18 +122,25 @@ function cateParseCore() {
 
   /* ---------- dictionary + growable columns ---------- */
 
+  /* String dictionary: id(s) returns a stable small integer (index into `list`) for each distinct
+   * string, so columns store Int32 ids instead of strings. `list` is shipped with the dataset. */
   function Dict() { this.list = []; this.map = new Map(); }
+  /* Id of string s, assigning the next free id on first sight. */
   Dict.prototype.id = function (s) {
     var v = this.map.get(s);
     if (v === undefined) { v = this.list.length; this.list.push(s); this.map.set(s, v); }
     return v;
   };
 
+  /* Growable typed-array column: values go into SEG-sized segments (so growth never copies) and
+   * finish() concatenates them into one exact-length array. Type is the typed array constructor. */
   function Col(Type) { this.Type = Type; this.segs = []; this.cur = new Type(SEG); this.pos = 0; this.n = 0; }
+  /* Append v, starting a new segment when the current one is full. */
   Col.prototype.push = function (v) {
     if (this.pos === SEG) { this.segs.push(this.cur); this.cur = new this.Type(SEG); this.pos = 0; }
     this.cur[this.pos++] = v; this.n++;
   };
+  /* Pack all segments into a single typed array of length n and release the segments. */
   Col.prototype.finish = function () {
     var out = new this.Type(this.n), off = 0;
     for (var k = 0; k < this.segs.length; k++) { out.set(this.segs[k], off); off += SEG; }
@@ -131,6 +153,9 @@ function cateParseCore() {
    * Returns a measurement key, or null when the header is a TestCase table whose kind
    * (Sensitivity vs MCBias) can only be told from the Units of the first row, or an
    * {error} object when the header fits nothing. */
+   /* How: a measurement token in the file name (e.g. "SCPreResults.csv") wins outright; otherwise the
+   * column signature decides: Difference+Baseline = Noise, NetName = MuxAuxPS (has USL) / SCPre,
+   * TestedLine = BTE (has USL) / MEMSSC, TestCase = Oscillation (Frequency or no LSL) or undecided. */
   function detectMeasurement(fileName, header) {
     var has = {};
     header.forEach(function (h) { has[h] = true; });
@@ -148,12 +173,17 @@ function cateParseCore() {
     }
     return { error: 'Cannot tell which result table this file holds (no TestCase/Channel/Element, NetName or TestedLine columns)' };
   }
+  /* TestCase tables: 'dB' units mean Sensitivity, 'V' or 'A' mean MCBias; anything else defaults to Sensitivity. */
   function measurementFromUnits(units) {
     return /^db$/i.test(units) ? 'Sensitivity' : (/^[va]$/i.test(units) ? 'MCBias' : 'Sensitivity');
   }
 
   /* ---------- record sink: header + records -> dataset ----------
    * measurement may be null for a TestCase table until the first row reveals the units. */
+  /* Constructor. measurement: key into MEASUREMENTS (or null, see above); meta: { fileName, fileSize,
+   * encoding, table } copied into stats. Builds one Col per output column (time, meas, lsl, usl as
+   * Float64; tc, coil, mode, chan, elem, net, sn, units, port as Int32 dictionary ids or -1; pf as
+   * Int8) and one Dict per string column. stats counts rows read / kept and why rows were dropped. */
   function RecordSink(measurement, meta) {
     this.measurement = measurement;
     this.spec = measurement ? MEASUREMENTS[measurement] : MEASUREMENTS.Sensitivity;
@@ -177,6 +207,9 @@ function cateParseCore() {
     this.header = null; this.ci = null; this.maxIdx = 0; this.defaultUnitsId = -1;
   }
   /* Returns an error string or null. */
+  /* Normalises the header (strips a UTF-8 BOM and whitespace), builds the name -> index map `ci`,
+   * checks the schema's required columns, records the highest column index a row must reach
+   * (maxIdx) and allocates the extra numeric columns (spec.extras) that feed the tooltip. */
   RecordSink.prototype.setHeader = function (fields) {
     var header = fields.map(function (h) { return String(h).replace(/^﻿/, '').trim(); });
     var ci = {};
@@ -190,6 +223,14 @@ function cateParseCore() {
     this.extras = (this.spec.extras || []).map(function (n) { return { name: n, idx: ci[n], col: new Col(Float64Array) }; });
     return null;
   };
+  /* Ingest one row (array of field strings in header order). Validation order, each failure counted in
+   * stats.dropped: too few fields; NA CoilName / Mode / key columns (Channel+Element or NetName /
+   * TestedLine); excluded modes; unparsable TimeDate; non-numeric TestCase (tc tables); non-numeric
+   * value column. Units and PassFail are read with a swap fix: when the Units cell is not a unit
+   * (empty, NA, or 'PASS'/'FAIL', as in SCPreResults exports where the two columns are swapped) the
+   * two values are exchanged. pf is 1 for PASS, 0 for FAIL, -1 otherwise. If the measurement is still
+   * undecided the first row's units pick Sensitivity vs MCBias. Then pushes one value into every
+   * column (ids via the dictionaries, -1 for columns the key kind does not use) and tracks tMin/tMax. */
   RecordSink.prototype.record = function (fields) {
     var ci = this.ci, stats = this.stats, dicts = this.dicts, cols = this.cols;
     stats.rowsRead++;
@@ -256,8 +297,12 @@ function cateParseCore() {
     if (t < stats.tMin) stats.tMin = t;
     if (t > stats.tMax) stats.tMax = t;
   };
+  /* True when s looks like a real units cell: non-empty, not an NA token and not a PASS/FAIL verdict. */
   function isUnits(s) { return s !== '' && NA_TOKENS[s] !== true && !/^(pass|fail)$/i.test(s); }
   /* Returns { message, transfer } ready for post(). */
+  /* Packs every Col (and the extras) into exact-length typed arrays, collects their ArrayBuffers in
+   * `transfer` so postMessage can move them without copying, and ships the dictionary string lists
+   * and stats alongside. An undecided measurement falls back to Sensitivity. */
   RecordSink.prototype.finish = function () {
     var columns = {}, transfer = [], cols = this.cols, dicts = this.dicts, stats = this.stats;
     for (var k in cols) { columns[k] = cols[k].finish(); transfer.push(columns[k].buffer); }
@@ -275,6 +320,14 @@ function cateParseCore() {
    * Scans `text` from 0, calling onRecord(fields) for every complete record.
    * Returns the index just past the last complete record (the rest is carry).
    * Handles quoted fields, "" escapes, commas inside quotes, CRLF, LF.
+   *
+   * State machine over char codes: `fieldStart` marks the current field; a '"' exactly at fieldStart
+   * enters quoted mode (`quoted` remembers it so the surrounding quotes are stripped when the field
+   * ends, `hasEscape` that "" must be unescaped). Inside quotes only '"' matters: a doubled quote is
+   * an escape, a single one closes the quoted part. Outside quotes ',' ends a field and '\n' / '\r' /
+   * '\r\n' end a record; blank records (a single empty field) are dropped. `lastComplete` is only
+   * advanced after a record is emitted, so a record split across chunks is re-scanned together with
+   * the next chunk. A '\r' as the very last char is treated as incomplete because its '\n' may follow.
    */
   function scan(text, onRecord) {
     var n = text.length, i = 0, lastComplete = 0;
@@ -330,6 +383,10 @@ function cateParseCore() {
    *           {type:'dataset', measurement, keyKind, n, columns:{...}, dicts:{...}, stats:{...}}
    *           {type:'done'}
    * opts: { chunkSize, yieldFn, fileName, measurement (force) }
+   * Flow: attempt('utf-8', fatal) streams the file; if the decoder throws on an invalid byte
+   * sequence the whole file is re-read as windows-1252. Each chunk is appended to the carry from
+   * the previous one, scanned, and the unconsumed tail becomes the new carry. The returned promise
+   * resolves to { done } / { error } after the last message has been posted (post is synchronous).
    */
   function parseFile(file, post, opts) {
     opts = opts || {};
@@ -343,6 +400,9 @@ function cateParseCore() {
       return res;
     });
 
+    /* One full pass over the file with the given TextDecoder encoding. fatal=true makes decode()
+     * throw on bad bytes, which is reported as { encodingError: true } so the caller can retry.
+     * Holds the per-pass state (sink, carry, bundle bookkeeping) in closure variables. */
     function attempt(encoding, fatal) {
       var decoder;
       try { decoder = new TextDecoder(encoding, { fatal: fatal }); }
@@ -357,14 +417,18 @@ function cateParseCore() {
        * A second header row without a marker also starts a new table (detected from its columns). */
       var bundle = false, sectionTable = null, skipSection = false, datasets = 0;
 
+      /* Measurement key whose MEASUREMENTS[].table equals a "#table=" section name (case-insensitive), or null. */
       function measurementForTable(name) {
         for (var i = 0; i < MEASUREMENT_ORDER.length; i++) if (MEASUREMENTS[MEASUREMENT_ORDER[i]].table.toLowerCase() === name.toLowerCase()) return MEASUREMENT_ORDER[i];
         return null;
       }
+      /* A record is a header row when it carries CoilName and TimeDate columns (BOM / whitespace tolerant). */
       function looksLikeHeader(fields) {
         var has = {}; fields.forEach(function (h) { has[h.replace(/^﻿/, '').trim()] = true; });
         return !!(has.CoilName && has.TimeDate);
       }
+      /* Finish the current table (if any): post its dataset, or a 'tablesEmpty' note when a bundle
+       * section had no usable rows, then reset the per-section state for the next one. */
       function closeSection() {
         if (sink !== null && !skipSection && !headerError) {
           var out = sink.finish();
@@ -373,6 +437,12 @@ function cateParseCore() {
         }
         sink = null; headerError = null; detectedPosted = false; skipSection = false;
       }
+      /* Record callback for scan(). Dispatches on state: a 1-2 field "#table=Name" / "[Name]" record
+       * starts a new bundle section; with no sink yet the record is the header, which picks the
+       * measurement (section name, forced opts.measurement, or detectMeasurement) and creates the
+       * RecordSink (sections with unknown tables or bad headers are skipped, single files error out);
+       * a later record that itself looks like a header starts the next table of an unmarked bundle;
+       * everything else is a data row for the sink. The first kept row posts 'detected'. */
       function onRecord(fields) {
         var f0 = (fields[0] || '').replace(/^﻿/, '').trim();
         if (fields.length <= 2 && (/^#table=/i.test(f0) || /^\[[A-Za-z0-9_ ]+\]$/.test(f0))) {   // section marker
@@ -413,6 +483,8 @@ function cateParseCore() {
         }
       }
 
+      /* Read, decode and scan the next chunk, post throttled progress (every 80 ms), then recurse
+       * (through yieldFn when running on the main thread) until the whole file has been consumed. */
       function step() {
         if (off >= total) return finish();
         var end = Math.min(off + chunkSize, total);
@@ -436,6 +508,8 @@ function cateParseCore() {
         });
       }
 
+      /* Flush the decoder and the carry (adding a final newline so the last record is emitted),
+       * close the last section and post 'done', or an error for an empty file / bundle. */
       function finish() {
         var tail;
         try { tail = decoder.decode(); } catch (e) { return { encodingError: true }; }
@@ -461,6 +535,10 @@ function cateParseCore() {
    * 'dataset' message per table (Sensitivity first), then 'done'. Tables with an unexpected
    * layout post {type:'tableError', measurement, table, message} and are skipped.
    * opts: { jet: cateJetCore() instance (required), yieldFn, tables: [measurement keys] }
+   * Flow: open the database, keep the wanted tables that exist, read their TDEFs and usage maps to
+   * know the page counts (progress is reported in page bytes across all tables), then scan the
+   * tables one after another through db.scan(), feeding each decoded row (nulls -> '') into a
+   * RecordSink built from the table's column names. Empty tables are reported as 'tablesEmpty'.
    */
   function parseMdb(file, post, opts) {
     opts = opts || {};
@@ -494,6 +572,8 @@ function cateParseCore() {
         var idx = 0;
         if (skipped.length) post({ type: 'tablesEmpty', measurements: skipped });
         if (!plan.length) { post({ type: 'error', message: 'Every result table in ' + fileName + ' is empty' }); return { error: 'empty' }; }
+        /* Scan plan[idx] into a fresh RecordSink and post its dataset, then move on; posts 'done'
+         * after the last table. Header errors and tables with no kept rows are reported and skipped. */
         function nextTable() {
           if (idx >= plan.length) { post({ type: 'done' }); return { done: true }; }
           var p = plan[idx++], spec = MEASUREMENTS[p.key];

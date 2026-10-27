@@ -1,6 +1,15 @@
 /* chart.js - canvas renderer reproducing the matplotlib run charts.
  * Logical coordinate space: 1950 x 1050 (13 x 7 in at 150 dpi) for the chart, plus an optional
  * statistics panel below it. 1 pt = 150/72 px.
+ *
+ * The renderer is pure drawing: model.js's chartSpec() builds a `spec` (title1/2, yLabel, xMin/xMax in
+ * epoch ms, yMin/yMax, series [{ label, color, shape, big, xs, ys, flags }], lsl/usl limit spans,
+ * outliers, stats rows, notes) and app.js calls render() for the on-screen canvas, renderToBlob()
+ * for the PNG export / zip download and hitTest() for the tooltip. draw() paints everything in the
+ * logical 1950 x 1050 space; render() only scales the context, so screen, thumbnail and export
+ * output are identical. Per-point flags: 0 normal, 1 high outlier pinned to the top band, 2 low
+ * outlier pinned to the bottom band, 3 flagged but drawn in place. CATE.ticks supplies the axis
+ * tick positions and label formatting.
  */
 (function (root) {
   'use strict';
@@ -22,8 +31,11 @@
   var STATS_ROW = 1.7 * F_STATS, STATS_FOOT = 1.4 * F_STATS;
   var COLOR_OUT = '#F37F63';                       // GEHC coral
 
+  /* Canvas font string for a size in logical px (and optional weight) in the chart font stack. */
   function font(px, weight) { return (weight ? weight + ' ' : '') + px.toFixed(2) + 'px ' + FONT; }
 
+  /* Trace a marker path (no fill / stroke) of the given shape centred on (x, y). r is the circle
+   * radius; the other shapes are scaled to look the same visual size as matplotlib's markers. */
   function drawMarker(ctx, shape, x, y, r) {
     ctx.beginPath();
     switch (shape) {
@@ -43,6 +55,7 @@
     }
   }
 
+  /* Trace a rounded rectangle path with corner radius r. */
   function roundRect(ctx, x, y, w, h, r) {
     ctx.beginPath();
     ctx.moveTo(x + r, y); ctx.lineTo(x + w - r, y); ctx.arcTo(x + w, y, x + w, y + r, r);
@@ -51,17 +64,29 @@
     ctx.lineTo(x, y + r); ctx.arcTo(x, y, x + r, y, r); ctx.closePath();
   }
 
+  /* Number -> text with d decimals (default 2) via ticks.formatNumber; NaN / null / undefined -> em dash. */
   function fmtNum(v, d) { return v === v && v !== null && v !== undefined ? T.formatNumber(v, d === undefined ? 2 : d) : '—'; }
 
   /* ---------- statistics panel height ---------- */
+  /* Logical height of the statistics panel: 0 without spec.stats or with opts.noStats, else
+   * header row + one row per entry + footnotes + padding. */
   function statsHeight(spec, opts) {
     opts = opts || {};
     if (!spec.stats || opts.noStats) return 0;
     return 0.5 * PAD + STATS_ROW * (1 + spec.stats.rows.length) + STATS_FOOT * spec.stats.footnotes.length + PAD;
   }
+  /* Total logical height: the fixed chart area plus the statistics panel. */
   function heightFor(spec, opts) { return H0 + statsHeight(spec, opts); }
 
   /* ---------- layout in logical units ---------- */
+  /* Compute the plot rectangle and coordinate mappers for a spec. Ticks come from CATE.ticks; the
+   * left margin grows with the widest y tick label (or band label), the bottom margin with the
+   * 45-degree rotated date labels. Returns L: x0/y0/x1/y1/pw/ph (full axes box), tick arrays and
+   * labels, and in flag mode the off-scale bands: topBand/botBand heights (BAND_FRAC of ph each,
+   * only when there are high / low pinned outliers), my0/my1/mph (the main data region between the
+   * bands) and pinTop/pinBot (band centre lines where pinned points sit). sx(t) maps time to x,
+   * sy(v) maps a value to y inside the main region, ptY(s, i) gives the drawn y of point i of
+   * series s honouring its flag (1 -> pinTop, 2 -> pinBot, else sy). */
   function layout(ctx, spec) {
     var yt = T.numericTicks(spec.yMin, spec.yMax);
     var yLabels = yt.ticks.map(function (v) { return T.formatNumber(v, yt.decimals); });
@@ -106,6 +131,12 @@
   }
 
   /* ---------- legend geometry + best placement ---------- */
+  /* Build the legend entries (one per series, per LSL/USL label, plus an outlier summary line),
+   * measure the box, and pick a position the way matplotlib's loc='best' does: candidate corners /
+   * edges inside the main region are scored by the number of data points and spec lines the box
+   * would cover (overlapping a note box costs 50); the lowest score wins and the first zero stops
+   * the search. Returns null when there is nothing to show, else { entries, x, y, w, h, fs,
+   * borderPad, handleLen, handlePad, spacing, rowH } for draw() to paint. */
   function legendLayout(ctx, spec, L) {
     var entries = [];
     spec.series.forEach(function (s) { entries.push({ kind: 'marker', label: s.label, color: s.color, shape: s.shape, big: s.big }); });
@@ -159,6 +190,8 @@
     return { entries: entries, x: best.x, y: best.y, w: w, h: h, fs: fs, borderPad: borderPad, handleLen: handleLen, handlePad: handlePad, spacing: spacing, rowH: rowH };
   }
 
+  /* Flagged point: white marker with a coral ring (slightly larger than normal) and a small dot of
+   * the series colour inside, so the machine stays identifiable. */
   function drawOutlierMarker(ctx, shape, x, y, r, color) {
     ctx.save();
     ctx.globalAlpha = 1;
@@ -170,6 +203,8 @@
     ctx.restore();
   }
 
+  /* Draw a text note in a translucent white rounded box with a coloured border, (x, y) = text
+   * top-left; returns the box height so several notes can be stacked. */
   function noteBox(ctx, text, x, y, color) {
     ctx.save();
     ctx.font = font(F_NOTE);
@@ -186,6 +221,16 @@
   }
 
   /* ---------- draw the whole chart (and stats panel) in logical units ---------- */
+  /* Paint order (matching the matplotlib z-order): white background, grid lines in the main region,
+   * then clipped to the axes box: the shaded off-scale bands with dashed separators, LSL/USL spec
+   * lines (each span limited to the dates its revision applied, with a dotted riser where the limit
+   * changed), normal-size series then 'big' series, then every flagged point with its outlier ring.
+   * Pinned points also get their true value printed in the band: labels are tried in three lanes
+   * (centre, above, below) on the right then left of the marker and dropped when they would leave
+   * the band or overlap a marker or an earlier label (spec.labelStats records drawn/skipped/rects).
+   * After unclipping: axes frame, ticks and labels (band labels in the y-tick margin), axis titles,
+   * the two title lines, note boxes, legend, statistics panel and the optional watermark.
+   * opts: { noStats, watermark }. Returns the layout L. */
   function draw(ctx, spec, opts) {
     opts = opts || {};
     var H = heightFor(spec, opts);
@@ -222,6 +267,8 @@
     // spec lines (zorder 2); a revised limit is drawn only over the dates it applied (l.x0/l.x1 in ms,
     // null = chart edge) with a thin dotted riser where the spec changed
     ctx.lineWidth = LW_SPEC;
+    /* One spec line l = { value, x0, x1, riserFrom, label } clipped to the plot; skipped when its
+     * date span is empty. The riser joins the previous revision's value to this one at x0. */
     function specLine(l, color, dash) {
       var y = L.sy(l.value);
       var xa = l.x0 == null ? L.x0 : Math.max(L.x0, L.sx(l.x0)), xb = l.x1 == null ? L.x1 : Math.min(L.x1, L.sx(l.x1));
@@ -279,6 +326,7 @@
         var yMin = bandTop + 1, yMax = bandTop + bandH - 1;
         // every marker in the band blocks text (markers all sit on the pin line)
         var blocks = list.map(function (m) { return { x0: m.x - m.r, x1: m.x + m.r, y0: pinY - m.r, y1: pinY + m.r }; });
+        /* True when label rect rc lies inside the band and clears every marker / placed label by `margin`. */
         function clear(rc) {
           if (rc.x0 < xMin || rc.x1 > xMax || rc.y0 < yMin || rc.y1 > yMax) return false;
           for (var b = 0; b < blocks.length; b++) {
@@ -401,6 +449,9 @@
   }
 
   /* ---------- statistics table below the chart ---------- */
+  /* Column definitions for the statistics table: `frac` is the share of the plot width, `fmt(row,
+   * spec)` overrides the default numeric formatting (fmtNum with spec.decimals). The 'cap' column's
+   * header comes from spec.stats.capHeader (Cpk / Cpu / Cpl, depending on which limits exist). */
   var STAT_COLS = [
     { key: 'label', title: 'Machine', frac: 0.14, align: 'left' },
     { key: 'n', title: 'n', frac: 0.05, align: 'right', fmt: function (r) { return String(r.n); } },
@@ -419,6 +470,9 @@
     { key: 'cap', title: '', frac: 0.08, align: 'right', fmt: function (r, spec) { var h = spec.stats.capHeader; return h ? fmtNum(h === 'Cpk' ? r.cpk : h === 'Cpu' ? r.cpu : r.cpl) : '—'; } }
   ];
 
+  /* Draw the statistics table under the chart, spanning the plot width: a rule, bold header row,
+   * one row per spec.stats.rows entry (machine marker + label, then the STAT_COLS values; the
+   * trailing 'All machines' row is bold), light rules between rows and the footnotes below. */
   function drawStats(ctx, spec, L) {
     var st = spec.stats;
     var x0 = L.x0, x1 = L.x1, w = x1 - x0;
@@ -482,6 +536,9 @@
   /* ---------- public API ---------- */
 
   /* Render into a <canvas> element at CSS width cssW, honouring DPR. Returns layout info for hit testing. */
+  /* Sizes the canvas backing store to cssW * dpr (height follows the spec's logical height), scales
+   * the context by k = backing width / W0 so draw() can work in logical units, then resets the
+   * transform. The returned { L, k, cssScale, H } lets hitTest() map CSS pixels back to logical. */
   function render(canvas, spec, opts) {
     opts = opts || {};
     var H = heightFor(spec, opts);
@@ -500,6 +557,7 @@
   }
 
   /* Render to a PNG Blob at the given pixel width (default 1950); height follows the spec. */
+  /* Draws on an offscreen canvas scaled by width / W0 and resolves with the PNG from canvas.toBlob(). */
   function renderToBlob(spec, opts) {
     opts = opts || {};
     var H = heightFor(spec, opts);
@@ -519,6 +577,9 @@
    * Also returns the other points drawn on top of / next to the nearest one (within about one marker radius)
    * as `stacked` (capped at HIT_LIST_MAX - 1, sorted by time), with `stackedTotal` the uncapped count. */
   var HIT_LIST_MAX = 8;
+  /* How: converts (cx, cy) and radius to logical units with info.cssScale, scans series from last to
+   * first (so the topmost drawn series wins ties) for the closest point within the radius, then
+   * collects every other point within about one big-marker radius of it. px/py are returned in CSS px. */
   function hitTest(info, spec, cx, cy, radius) {
     var s = info.cssScale, L = info.L;
     var lx = cx / s, ly = cy / s;

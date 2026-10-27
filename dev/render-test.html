@@ -1,4 +1,14 @@
 <!DOCTYPE html>
+<!--
+  dev/render-test.html: canvas rendering check without the dashboard UI. Loads the engine scripts
+  (parse-core, ticks, model, chart, zip, loader) and sample-data.js, parses the four CATE Sensitivity
+  excerpts through CATE.Loader, builds with a fixed date range (2026-09-26 .. 2026-10-01, 1.5T GEM PA
+  overridden to the whole year), renders three known charts (one with the PARTIAL DATA watermark), the
+  GEM PA chart again in outlier flag and exclude mode with the statistics panel, and runs a zip / CRC
+  smoke test. Every step is written to the #log div and the console (prefix "LOG"); the title becomes
+  "render test done" at the end. Run headless: node dev/headless.js --url "file:///.../dev/render-test.html"
+  --until "render test done" --out render.png. Query string: ?nowork parses on the main thread instead of workers.
+-->
 <html>
 <head>
 <meta charset="utf-8">
@@ -16,6 +26,7 @@
 <script src="sample-data.js"></script>
 <script>
 (function () {
+  // log(s): append a line to the #log div and echo it to the console.
   var log = function (s) { console.log('LOG ' + s); document.getElementById('log').textContent += s + '\n'; };
   log('script start; sample machines: ' + Object.keys(window.SAMPLE_CSV || {}).join(','));
   window.addEventListener('error', function (e) { log('WINDOW ERROR ' + e.message + ' @' + e.filename + ':' + e.lineno); });
@@ -34,6 +45,8 @@
     var f = new File([window.SAMPLE_CSV[name]], name + '.csv', { type: 'text/csv' });
     loader.addFiles([f]);
   });
+  // Called once every sample file has been indexed: builds the model, renders the target charts into new
+  // canvases appended to the body, then the outlier-mode variants and the zip check.
   function run() {
     var settings = { start: T.parseIsoDate('2026-09-26'), end: T.parseIsoDate('2026-10-01'),
       overrides: [{ coil: '1.5T GEM PA', start: T.parseIsoDate('2026-01-01'), end: T.todayUtc() }] };

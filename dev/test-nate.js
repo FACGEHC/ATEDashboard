@@ -4,6 +4,11 @@
 //    CSV copies row for row (AutoNumber order = write order; MEMO columns are compared too);
 // 2. js/parse-core.js loads the database like the browser would and reports a dataset per
 //    populated measurement table with the same row counts.
+// How it works: the .mdb is opened through jet.fileSource over a Node file shim (slice -> arrayBuffer),
+// every user table is scanned in full and sorted by AutoNumber; the CSV copy is parsed with a small
+// quote-aware reader and compared cell for cell. parse-core then loads the same file via parseMdb (the
+// browser worker path) and, with the CSV folder, each per-table CSV and the <machine>.csv bundle via
+// parseFile. Exit code 1 and "N FAILURES" on any difference, else "ALL CHECKS PASSED".
 const fs = require('fs');
 const path = require('path');
 const cateJetCore = require('../js/jet-core.js');
@@ -13,8 +18,10 @@ const mdb = process.argv[2];
 const csvDir = process.argv[3];
 if (!mdb) { console.error('usage: node dev/test-nate.js <NATE.mdb> [<csv folder>]'); process.exit(2); }
 let fails = 0;
+// Counts a failure and prints the first 40 messages.
 function fail(msg) { fails++; if (fails <= 40) console.error('FAIL', msg); }
 
+// Minimal in-memory CSV parser (quoted fields, "" escapes, CR ignored); returns an array of rows.
 function parseCsv(text) {
   const rows = []; let row = [], field = '', i = 0, q = false;
   while (i < text.length) {
@@ -33,16 +40,20 @@ function parseCsv(text) {
   return rows;
 }
 
+// Locates the converter's CSV copy of a table in the csv folder (null without a folder or file).
 function findCsv(table) {           // <Table>.csv or <machine>_<Table>.csv
   if (!csvDir) return null;
   const hit = fs.readdirSync(csvDir).find(n => n.toLowerCase() === (table + '.csv').toLowerCase() || n.toLowerCase().endsWith('_' + table.toLowerCase() + '.csv'));
   return hit ? path.join(csvDir, hit) : null;
 }
+// Wraps a file on disk as the subset of the browser File API that jet-core and parse-core use:
+// {name, size, slice(a, b).arrayBuffer()} backed by fs.readSync.
 function nodeFile(p) {
   const fd = fs.openSync(p, 'r'), size = fs.statSync(p).size;
   return { name: path.basename(p), size, slice: (a, b) => ({ arrayBuffer: () => { const buf = Buffer.alloc(Math.min(b, size) - a); fs.readSync(fd, buf, 0, buf.length, a); return Promise.resolve(buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.length)); } }) };
 }
 
+// Main flow: Jet scan + CSV comparison per table, then the parse-core mdb, per-table CSV and bundle paths.
 (async () => {
   const jet = cateJetCore();
   const file = nodeFile(mdb);

@@ -1,5 +1,13 @@
 // Node end-to-end test: node --max-old-space-size=4096 dev/test-model.js ../data
 // Loads all four CSVs, builds with the Python defaults, compares chart counts to All_Coil_RunCharts.
+// Arguments: <data dir> (default ../../data) with CATE1001/1007/1003/1006.csv and, optionally,
+// CATE_1001.mdb and EVO1002_Data_Results.mdb; <reference dir> (default ../../All_Coil_RunCharts) holding
+// the PNG tree written by the Python script. How it works: unit checks of the pure helpers (machine name
+// detection, serial cleaning, outlier detection, descriptive statistics), then the CSVs are parsed with
+// parse-core and indexed into CATE.model, model.build runs with the Python default date range and the
+// chart count per coil is compared with the reference PNGs (manifest diff by file name). Spot checks on
+// known charts assert the chart spec (series, limits, outlier modes, statistics). With the .mdb files the
+// Access path (parseMdb -> addDataset) is exercised for every measurement table. Ends with ALL ASSERTIONS PASSED.
 const fs = require('fs');
 const path = require('path');
 const cateParseCore = require('../js/parse-core.js');
@@ -29,10 +37,12 @@ eq(CATE.cleanSn('test'), 'test', 'cleanSn: text');
 eq(CATE.machineFamily('EVO1002'), 'EVO', 'family: EVO'); eq(CATE.machineFamily('CATE1001'), 'CATE', 'family: CATE');
 eq(CATE.machineFamily('NATE1001'), 'NATE', 'family: NATE');
 
+// Assertion helper: deep-equal via JSON (NaN == NaN allowed); counts failures, prints ok / FAIL with both values.
 function eq(a, b, msg) {
   const ok = (Number.isNaN(a) && Number.isNaN(b)) || a === b || JSON.stringify(a) === JSON.stringify(b);
   if (!ok) { fails++; console.error('FAIL', msg, '\n  got     ', a, '\n  expected', b); } else console.log('ok  ', msg);
 }
+// Assertion helper for floats: |a - b| <= eps.
 function near(a, b, eps, msg) { const ok = Math.abs(a - b) <= eps; if (!ok) { fails++; console.error('FAIL', msg, 'got', a, 'expected', b); } else console.log('ok  ', msg); }
 
 // --- synthetic outlier / statistics checks
@@ -54,6 +64,8 @@ s = CATE.describe([2, 4, 4, 4, 5, 5, 7, 9], NaN, 10); eq(Number.isNaN(s.cpl) && 
 const dataDir = process.argv[2] || path.join(__dirname, '..', '..', 'data');
 const refDir = process.argv[3] || path.join(__dirname, '..', '..', 'All_Coil_RunCharts');
 
+// Parses one machine CSV with parse-core (Blob input, single dataset message) and registers it in the
+// model under the machine index taken from the file name; prints parse / index timings.
 async function load(file) {
   const m = CATE.machineIndexFromName(path.basename(file));
   const buf = fs.readFileSync(file);
@@ -65,6 +77,7 @@ async function load(file) {
   console.log(`${path.basename(file)} -> ${CATE.MACHINES[m]} ${done.measurement}: ${done.n} rows kept / ${done.stats.rowsRead} read, ${done.stats.encoding}, parse ${t1 - t0} ms, index ${Date.now() - t1} ms`);
 }
 
+// Main flow: load CSVs, build, compare with the reference tree, spot-check specs, then the .mdb paths.
 (async () => {
   for (const f of ['CATE1001.csv', 'CATE1007.csv', 'CATE1003.csv', 'CATE1006.csv']) {
     const p = path.join(dataDir, f);
@@ -101,6 +114,7 @@ async function load(file) {
   }
   // manifest diff
   const refFiles = [];
+  // Collects every PNG under refDir as "<coil>/<mode dir>/<file>", skipping folders that start with "_".
   (function walk(d, rel) {
     for (const e of fs.readdirSync(d)) {
       const p = path.join(d, e);

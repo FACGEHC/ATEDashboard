@@ -8,6 +8,14 @@
  * Scope: Jet4-format .mdb (Access 2000+) and ACE .accdb headers with 4096-byte pages, TEXT / LONG /
  * INT / BOOL / DOUBLE columns. Memo, OLE and other types decode as null. Overflow rows are skipped.
  * Layout follows the mdbtools HACKING notes and was checked against data/CATE_1001.mdb.
+ *
+ * How it works: open(src) checks the page-0 signature, reads the system catalog (MSysObjects, whose
+ * TDEF is on page 2) to map table names to their TDEF pages, and returns a `db` handle. db.table(name)
+ * parses a table definition (column types, fixed offsets, variable-column numbers, names);
+ * db.scan(tdef, ...) walks the table's usage map to find its data pages, reads them in contiguous
+ * runs and decodes every live row with decodeRow(), handing the wanted columns to a callback as
+ * strings. parse-core.js's parseMdb() drives it (opts.jet), loader.js embeds it in the worker, and
+ * dev/test-jet.js checks it against the reference CSV exports.
  */
 function cateJetCore() {
   'use strict';
@@ -15,6 +23,7 @@ function cateJetCore() {
   var OFFSET_MASK = 0x1FFF, FLAG_DELETED = 0x8000, FLAG_LOOKUP = 0x4000;
   var T_BOOL = 0x01, T_BYTE = 0x02, T_INT = 0x03, T_LONG = 0x04, T_DOUBLE = 0x07, T_DATETIME = 0x08, T_TEXT = 0x0A;
 
+  /* Little-endian readers over a Uint8Array at byte offset o (Jet stores every integer little-endian). */
   function u16(b, o) { return b[o] | (b[o + 1] << 8); }
   function u32(b, o) { return (b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24)) >>> 0; }
   function i16(b, o) { var v = u16(b, o); return v & 0x8000 ? v - 0x10000 : v; }
@@ -27,6 +36,9 @@ function cateJetCore() {
 
   /* Jet4 text: "FF FE" prefix marks a compressed string (one byte per char, a 0x00 byte toggles
    * to / from UTF-16LE segments); anything else is plain UTF-16LE. */
+   /* Walks the compressed form byte by byte: in narrow mode bytes are collected into a run that
+   * flushNarrow() converts on a 0x00 toggle (or at the end); in wide mode each byte pair is one
+   * UTF-16 code unit until a 0x00 byte switches back. Returns the decoded JS string. */
   function decodeText(b, start, end) {
     if (end - start >= 2 && b[start] === 0xFF && b[start + 1] === 0xFE) {
       var out = '', i = start + 2, wide = false, run = i;
@@ -45,6 +57,7 @@ function cateJetCore() {
     }
     return dec16.decode(b.subarray(start, end));
   }
+  /* Narrow bytes [s, e) -> string: raw char codes when all ASCII (or no cp1252 decoder), else windows-1252. */
   function flushNarrow(b, s, e) {
     if (e <= s) return '';
     var ascii = true;
@@ -54,6 +67,9 @@ function cateJetCore() {
   }
 
   /* Row r of a data page: { start, end, deleted, lookup } with offsets inside the page, or null. */
+  /* Data page layout: row count at 0x0C, then one u16 per row from 0x0E holding the row's start offset
+   * in the low 13 bits plus deleted / lookup flags. Rows are laid out from the page end backwards, so a
+   * row ends where the previous row starts and row 0 ends at PG. */
   function rowSpan(b, r) {
     var n = u16(b, 0x0C);
     if (r < 0 || r >= n) return null;
@@ -62,6 +78,11 @@ function cateJetCore() {
     return { start: raw & OFFSET_MASK, end: end, deleted: !!(raw & FLAG_DELETED), lookup: !!(raw & FLAG_LOOKUP) };
   }
 
+  /* Parse a (joined) TDEF page buffer into { page, numRows, numVarCols, numCols, numIdx, numRealIdx,
+   * usageMapPtr, freeMapPtr, cols, byName }. Column descriptors (25 bytes each: type, column number,
+   * variable-column number, flags with bit 0 = fixed length, fixed offset, size) start after the
+   * index headers at 0x3F + 12 * numRealIdx, followed by the UTF-16LE column names (u16 length +
+   * bytes) in the same order. byName indexes the descriptors by column name. */
   function parseTdef(buf, page) {
     var t = { page: page, numRows: u32(buf, 0x10), numVarCols: u16(buf, 0x2B), numCols: u16(buf, 0x2D),
               numIdx: u32(buf, 0x2F), numRealIdx: u32(buf, 0x33), usageMapPtr: u32(buf, 0x37), freeMapPtr: u32(buf, 0x3B),
@@ -81,6 +102,12 @@ function cateJetCore() {
   }
 
   /* Decode one row into `out` (array aligned with `wanted`, strings or null). */
+  /* Row layout (Jet4): u16 column count, fixed-length column bytes, variable-length column bytes,
+   * then from the row end backwards: the null mask (one bit per column, 1 = value present), u16
+   * variable-column count and a table of u16 offsets (offs[i] = start of var column i, offs[nVar] =
+   * end). For every wanted column descriptor the slice [s, e) is located via fixedOffset or the
+   * offset table and converted by type to a string (BOOL comes from the mask bit itself; unsupported
+   * types stay null). Returns false when the row is too short to hold its mask / offset table. */
   function decodeRow(tdef, b, start, end, wanted, out) {
     var ncols = u16(b, start);
     var nm = (ncols + 7) >> 3;
@@ -116,14 +143,21 @@ function cateJetCore() {
     return true;
   }
 
+  /* Open a database from a source { size, read(offset, len) -> Promise<ArrayBuffer> }. Resolves to the
+   * db handle { tables: Map name -> TDEF page, tdefs: cache, scan, table, tableNames, pagesOf,
+   * readTdef, version, signature } after verifying the "Standard Jet DB" / "Standard ACE DB"
+   * signature, rejecting Jet3 files and scanning MSysObjects (Type 1 = user table) for table names. */
   function open(src) {
     var pageCache = new Map();
+    /* Page p as a Uint8Array, cached (up to 512 pages) so TDEF and usage-map lookups do not re-read. */
     function readPage(p) {
       var hit = pageCache.get(p);
       if (hit) return Promise.resolve(hit);
       return src.read(p * PG, PG).then(function (ab) { var b = new Uint8Array(ab); if (pageCache.size < 512) pageCache.set(p, b); return b; });
     }
     /* TDEF pages chain through the "next page" field at 0x04; later pages contribute their bytes from 0x08. */
+    /* step() follows the chain, collecting the first page whole and continuation pages minus their
+     * 8-byte header (capped at 64 pages), then concatenates them for parseTdef(). */
     function readTdef(page) {
       var parts = [], total = 0;
       function step(p, first) {
@@ -140,6 +174,7 @@ function cateJetCore() {
       }
       return step(page, true);
     }
+    /* Bytes of the row addressed by a 32-bit row pointer (page << 8 | row), e.g. a usage-map pointer. */
     function rowBytes(ptr) {
       var page = ptr >>> 8, row = ptr & 0xFF;
       return readPage(page).then(function (b) {
@@ -149,6 +184,9 @@ function cateJetCore() {
       });
     }
     /* Pages owned by a table, ascending. */
+    /* Usage map types: 0x00 = inline bitmap (u32 start page at offset 1, then one bit per page);
+     * 0x01 = list of u32 page numbers of 0x05 bitmap pages, each covering (PG - 4) * 8 pages
+     * starting at idx * per. Resolves to a sorted Uint32Array of page numbers. */
     function parseUsageMap(ptr) {
       return rowBytes(ptr).then(function (m) {
         var pages = [];
@@ -186,6 +224,10 @@ function cateJetCore() {
 
     /* Scan every live row of a table. wantedNames: column names; onRow(fields) gets strings/null in that order.
      * opts: { batchPages (default 1024), onProgress(pagesDone, pagesTotal), yieldFn }. */
+     /* Resolves the usage map, groups consecutive pages into runs of at most `batch` pages so each
+     * run is one src.read(), and for every page that is a data page (type 0x01) belonging to this
+     * TDEF decodes its rows into one reused `fields` array (so onRow must copy what it keeps).
+     * Resolves to stats { rows, deleted, lookup, short, pages, wrongPages, pagesTotal }. */
     db.scan = function (tdef, wantedNames, onRow, opts) {
       opts = opts || {};
       var batch = opts.batchPages || 1024;
@@ -200,6 +242,7 @@ function cateJetCore() {
           runs.push({ start: s, len: j - i }); i = j;
         }
         var done = 0, idx = 0;
+        /* Read and decode the next run, report progress, yield if asked, then continue. */
         function next() {
           if (idx >= runs.length) return Promise.resolve(stats);
           var run = runs[idx++];
@@ -230,6 +273,7 @@ function cateJetCore() {
         return next();
       });
     };
+    /* TDEF for a table name, parsed once and cached in db.tdefs; rejects for unknown names. */
     db.table = function (name) {
       var cached = db.tdefs.get(name);
       if (cached) return Promise.resolve(cached);
@@ -237,7 +281,9 @@ function cateJetCore() {
       if (page === undefined) return Promise.reject(new Error('No table named "' + name + '"'));
       return readTdef(page).then(function (t) { db.tdefs.set(name, t); return t; });
     };
+    /* All table names found in the catalog (including the MSys* system tables). */
     db.tableNames = function () { return Array.from(db.tables.keys()); };
+    /* Data page numbers owned by a table (its usage map), used for progress estimates. */
     db.pagesOf = function (tdef) { return parseUsageMap(tdef.usageMapPtr); };
     db.readTdef = readTdef;
 
@@ -259,6 +305,7 @@ function cateJetCore() {
   }
 
   /* Browser File -> source */
+  /* Each read() slices the File and loads only that byte range, so nothing beyond the requested pages is held. */
   function fileSource(file) {
     return { size: file.size, read: function (offset, len) { return file.slice(offset, Math.min(offset + len, file.size)).arrayBuffer(); } };
   }

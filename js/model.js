@@ -1,5 +1,29 @@
 /* model.js - columnar data store (per machine + measurement), coil/date-range filtering, grouping, chart specs.
  * Attached to globalThis.CATE so it runs in the browser and in Node tests.
+ *
+ * How it fits in: parse-core.js (in a worker, see loader.js) turns one CSV / .mdb result table into a
+ * 'dataset' payload (typed columns + local string dictionaries); addDataset() merges it into CATE.model,
+ * the single in-memory store that the UI (app.js), the renderer (chart.js) and the exports read from.
+ * Nothing in this file touches the DOM.
+ *
+ * Store layout: Model.machines[m] (m = index into CATE.MACHINES) -> { datasets: { measurement: ds } }.
+ * A dataset ds holds one result table of one machine as parallel typed arrays indexed by row:
+ *   time (epoch ms), meas, lsl, usl (Float64, NaN = no limit), tc (test case number), coil, mode, chan,
+ *   elem, net, sn, units, port (Int32 ids into the global string dictionaries in Model.dict, -1 = none),
+ *   pf (Int8 PassFail: 1 pass, 0 fail, -1 not recorded), extras (optional per-measurement columns).
+ * ds.rowsByCoil[coilId] lists the row indices of each coil type so a coil's charts never scan the whole table.
+ * Serial numbers are kept twice: dict.sn holds the raw string, snClean[snId] the id of its cleaned form
+ * (cleanSn: part before a dash, leading zeros stripped) used for counting distinct coils and grouping runs.
+ *
+ * What the file provides, in order:
+ *   - constants: machine list / styles, default date ranges, the MEASUREMENTS catalogue (one result table each);
+ *   - build() / buildCoil(): group the rows of a coil type and date range per chart key (Mode|TC|Ch|Elem or
+ *     Mode|Net), collecting spec-limit revisions, units, ports and distinct coil counts per machine;
+ *   - chartSpec(): turn one group into pure chart data (series, spec lines, y range, outlier flags, stats);
+ *   - outlier / descriptive statistics helpers (robustScale, detectOutliers, describe);
+ *   - runs() / yieldReport() / serialList(): test-run reconstruction and the first pass yield report;
+ *   - summaryRows() / toCsv(): summary tables and CSV output for the exports.
+ * Model.version increments on every add / remove so cached results (runs(), the UI's build cache) can be invalidated.
  */
 (function (root) {
   'use strict';
@@ -44,20 +68,28 @@
   /* Family of a machine name: 'CATE', 'EVO' or 'NATE' (used for the "- Single CATE" title suffix). */
   function machineFamily(name) { var m = /^(EVO|NATE)/i.exec(name || ''); return m ? m[1].toUpperCase() : 'CATE'; }
   /* Serial number used for distinct-coil counting: the part before a dash, leading zeros stripped
-   * ("000835-302823625" and "00835" are the same coil). */
+   * ("000835-302823625" and "00835" are the same coil).
+   * An all-zero serial keeps its base ("000" stays "000"); an empty base (e.g. "-123") falls back to the raw string.
+   */
   function cleanSn(sn) {
     var base = String(sn).replace(/-.*$/, '').trim();
     var cleaned = base.replace(/^0+/, '');
     return cleaned === '' ? (base === '' ? String(sn) : base) : cleaned;
   }
 
+  /* Index into CATE.MACHINES of the machine named in a file name ("CATE_1001.mdb", "evo1002_Data_Results.mdb"):
+   * family word, optional separator, four digits, any case. Returns -1 when no known machine is named. */
   function machineIndexFromName(name) {
     var m = /(CATE|EVO|NATE)[_ -]?(\d{4})/i.exec(name || '');
     if (!m) return -1;
     return CATE.MACHINES.indexOf(m[1].toUpperCase() + m[2]);
   }
 
-  /* Python make_safe_name */
+  /* Python make_safe_name
+   * Turns a coil / mode / channel name into a file-system safe folder or file name: characters illegal in
+   * Windows names become '-', runs of whitespace become one '_', repeated '_' collapse, and leading / trailing
+   * spaces, dots and underscores are trimmed. Must match the Python version so exported paths equal the old output.
+   */
   function makeSafeName(value) {
     var text = String(value).trim();
     text = text.replace(/[<>:"/\\|?*]/g, '-');
@@ -66,16 +98,26 @@
     return text.replace(/^[ ._]+|[ ._]+$/g, '');
   }
 
+  /* Comparator for sort(): plain code-point string order, so names sort the same as in the Python script. */
   function cmpStr(a, b) { return a < b ? -1 : (a > b ? 1 : 0); }     // code-point order like Python
+  /* Two-digit zero padding (test case numbers: "TC05"). */
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
+  /* String dictionary: interns strings as small integer ids so the columnar store can hold Int32 ids instead
+   * of strings. list[id] gives the string back, map.get(string) the id. One Dict per string column (coil,
+   * mode, chan, elem, net, sn, units, port) lives in Model.dict and is shared by every dataset. */
   function Dict() { this.list = []; this.map = new Map(); }
+  /* Id of string s, adding it to the dictionary on first sight. */
   Dict.prototype.id = function (s) {
     var v = this.map.get(s);
     if (v === undefined) { v = this.list.length; this.list.push(s); this.map.set(s, v); }
     return v;
   };
 
+  /* The in-memory store. dict: global string dictionaries; snClean / snCleanDict: raw serial id -> cleaned
+   * serial id; machines[m]: null or { name, index, datasets: { measurement: ds } }; version: bumped on every
+   * change so consumers can cache derived results (runs(), chart builds) keyed on it. CATE.model is the
+   * single instance used by the dashboard. */
   function Model() {
     this.dict = { coil: new Dict(), mode: new Dict(), chan: new Dict(), elem: new Dict(), net: new Dict(), sn: new Dict(), units: new Dict(), port: new Dict() };
     this.snClean = [];          // sn id -> cleaned-sn id (distinct coil counting)
@@ -84,7 +126,15 @@
     this.version = 0;
   }
 
-  /* Merge a worker 'dataset' payload for machine m / measurement into the global store. */
+  /* Merge a worker 'dataset' payload for machine m / measurement into the global store.
+   * parsed = { columns: { time, meas, lsl, usl, tc, coil, mode, chan, elem, net, sn, units, port?, pf?, extras? },
+   *            dicts: { coil, mode, ...: [strings] }, n, keyKind?, stats: { tMin, tMax, ... } }.
+   * The worker interned strings in its own local dictionaries, so each string column is remapped in place
+   * from local ids to the global ids of Model.dict (rows holding -1 stay -1); a serial seen for the first
+   * time also gets its cleaned form registered in snClean. Missing port / pf columns are filled with -1
+   * (older payloads). Builds ds.rowsByCoil, replaces any dataset already loaded for that machine +
+   * measurement, bumps version and returns the new ds. The typed arrays are adopted, not copied.
+   */
   Model.prototype.addDataset = function (m, measurement, parsed) {
     var self = this;
     var cols = parsed.columns;
@@ -119,6 +169,7 @@
   /* Backwards-compatible alias (Sensitivity CSV). */
   Model.prototype.addMachine = function (m, parsed) { return this.addDataset(m, parsed.measurement || 'Sensitivity', parsed); };
 
+  /* Drop one measurement of a machine; the machine entry goes too when it has no datasets left. */
   Model.prototype.removeDataset = function (m, measurement) {
     var mach = this.machines[m];
     if (!mach) return;
@@ -126,7 +177,9 @@
     if (!Object.keys(mach.datasets).length) this.machines[m] = null;
     this.version++;
   };
+  /* Drop everything loaded for machine m (a new .mdb replaces the whole machine). */
   Model.prototype.removeMachine = function (m) { this.machines[m] = null; this.version++; };
+  /* Machine entries with data, in CATE.MACHINES order (nulls skipped). */
   Model.prototype.loadedMachines = function () { return this.machines.filter(function (x) { return !!x; }); };
   /* Datasets of one measurement in machine order: [{ m, ds }]. */
   Model.prototype.datasetsFor = function (measurement) {
@@ -137,9 +190,11 @@
     }
     return out;
   };
+  /* True when something is loaded for `measurement`, or for any measurement when none is given. */
   Model.prototype.hasData = function (measurement) {
     return measurement ? this.datasetsFor(measurement).length > 0 : this.loadedMachines().length > 0;
   };
+  /* Measurement keys that have at least one dataset, in CATE.MEASUREMENT_ORDER. */
   Model.prototype.measurementsLoaded = function () {
     var self = this;
     return CATE.MEASUREMENT_ORDER.filter(function (k) { return self.datasetsFor(k).length > 0; });
@@ -167,6 +222,10 @@
     return mn === Infinity ? null : { tMin: mn, tMax: mx };
   };
 
+  /* Index a dataset's rows by coil id: out[coilId] is a Uint32Array of row indices (a subarray view into one
+   * shared ordering, rows in original order). Counting sort in two passes over ds.coil: histogram -> prefix
+   * sums give each coil's slice, then rows are scattered into their slice. nCoils is the size of the global
+   * coil dictionary at the time, so coils added later by other datasets are simply absent (undefined). */
   function buildRowsByCoil(ds, nCoils) {
     var n = ds.n, coil = ds.coil;
     var counts = new Uint32Array(nCoils + 1);
@@ -203,6 +262,8 @@
 
   /* Resolve settings into per-coil ranges.
    * settings = { start: ms, end: ms (inclusive day), overrides: [{coil, start: ms, end: ms}] }
+   * Returns { start, endIncl, endExcl, override }: the coil's own override when its name matches one exactly,
+   * otherwise the global range. endExcl = inclusive end day + 1 day, so rows are kept with start <= t < endExcl.
    */
   function rangeForCoil(settings, coilName) {
     var ov = settings.overrides || [];
@@ -212,6 +273,7 @@
     return { start: settings.start, endIncl: settings.end, endExcl: settings.end + DAY, override: false };
   }
 
+  /* Array with one slot per machine (CATE.MACHINES order) filled with v, or with v() when v is a factory. */
   function emptyPerMachine(v) { return CATE.MACHINES.map(function () { return typeof v === 'function' ? v() : v; }); }
 
   /* Spec limits can change over time (a spec revision): remember the first and last row date of each
@@ -221,6 +283,7 @@
     if (!sp) seen.set(value, { value: value, tFirst: t, tLast: t });
     else { if (t < sp.tFirst) sp.tFirst = t; if (t > sp.tLast) sp.tLast = t; }
   }
+  /* Spec revisions of one side as a list sorted by first use (ties by value): [{ value, tFirst, tLast }]. */
   function specSpans(seen) {
     return Array.from(seen.values()).sort(function (a, b) { return a.tFirst - b.tFirst || a.value - b.value; });
   }
@@ -247,7 +310,16 @@
     });
   }
 
-  /* Build groups for one coil and measurement. Returns coilResult. */
+  /* Build groups for one coil and measurement. Returns coilResult.
+   * coilEntry = { id, name } from coilList(); settings as rangeForCoil(). Walks the coil's rows in every
+   * loaded dataset of the measurement, keeps those inside the coil's date range and buckets them by chart
+   * key: Mode|TC|Ch|Elem for 'tc' measurements, Mode|Net for 'net' ones. Per group it records, per machine,
+   * the row indices (sorted by time), point count and number of distinct cleaned serials, plus the LSL / USL
+   * revision history (noteSpec), the units seen (majority wins, unitsMixed when more than one), the ports
+   * used, and the derived names mode, modeDir, fileName and caption (matching the Python output paths).
+   * Groups are sorted by mode, then test case / channel / element or net name.
+   * Returns { coilId, name, safeName, start, endIncl, endExcl, override, rowCount, groups, modes, measurement }.
+   */
   Model.prototype.buildCoil = function (coilEntry, settings, measurement) {
     measurement = measurement || 'Sensitivity';
     var MEAS = CATE.MEASUREMENTS[measurement], kind = MEAS.keyKind;
@@ -336,7 +408,11 @@
     };
   };
 
-  /* Build every coil for a measurement. */
+  /* Build every coil for a measurement.
+   * Runs buildCoil() for every coil in coilList(measurement) and returns
+   * { coils: [coilResult], totalCharts, version, measurement }. version is the model version the result was
+   * built from; app.js compares it to decide whether a cached build is still valid.
+   */
   Model.prototype.build = function (settings, measurement) {
     measurement = measurement || 'Sensitivity';
     var coils = this.coilList(measurement);
@@ -352,11 +428,13 @@
   /* ---------- outlier detection + descriptive statistics (pure) ---------- */
   CATE.OUTLIER_DEFAULTS = { mode: 'flag', k: 3.5, minN: 5, floor: 0.5 };   // floor in dB (Sensitivity); other measurements use MEASUREMENTS[].floor
 
+  /* Median of an already sorted numeric array (NaN when empty). */
   function median(sorted) {
     var n = sorted.length;
     if (!n) return NaN;
     return n % 2 ? sorted[(n - 1) / 2] : (sorted[n / 2 - 1] + sorted[n / 2]) / 2;
   }
+  /* Ascending plain-array copy of any array-like of numbers. */
   function sortedCopy(ys) { var a = Array.from(ys); a.sort(function (x, y) { return x - y; }); return a; }
 
   /* Robust centre/scale: median and MAD; scale = max(1.4826*MAD, floor). */
@@ -371,7 +449,12 @@
     return { n: n, median: med, mad: mad, scale: Math.max(1.4826 * mad, floor) };
   }
 
-  /* flags[i]: 0 normal, 1 high outlier, 2 low outlier. No flags when n < minN. */
+  /* flags[i]: 0 normal, 1 high outlier, 2 low outlier. No flags when n < minN.
+   * Modified z-score rule: a value is an outlier when |y - median| > k * scale, scale from robustScale() (the
+   * MAD floor keeps near-constant data from flagging tiny deviations). opts: { minN, floor }.
+   * Returns { flags, median, mad, scale, k, n, nHigh, nLow, count }; centre and scale are still reported when
+   * n < minN or k <= 0 (so the footnote can show them) but no point is flagged.
+   */
   function detectOutliers(ys, k, opts) {
     opts = opts || {};
     var minN = opts.minN !== undefined ? opts.minN : CATE.OUTLIER_DEFAULTS.minN;
@@ -423,6 +506,7 @@
   CATE.describe = describe;
   CATE.rowVerdict = rowVerdict;
 
+  /* Fixed-decimal formatting with a typographic minus sign (U+2212) for negatives, as the chart labels use. */
   function fmtD(v, d) { return (v < 0 ? '−' : '') + Math.abs(v).toFixed(d); }
 
   /* Chart spec for the renderer (pure data).
@@ -431,6 +515,23 @@
    *         runs: 'all'|'latest'|'first' (every row, or only each coil's latest / first test of this measurement) }
    *   (default: off, no stats; statsOutliers defaults to 'include' and only matters in flag mode,
    *    since exclude mode removes the points and off mode never flags any)
+   * How it works, in order:
+   *   1. rowsFor[m]: the group's rows per machine after the onlyMachine and port filters;
+   *   2. runs 'latest' / 'first': find each cleaned serial's latest (first) timestamp across the drawn
+   *      machines and keep only rows at that time (rows without a serial are kept); runsCoils = serials seen;
+   *   3. one series per machine with xs / ys / rows typed arrays and the machine's colour and marker;
+   *   4. outlier detection pooled over every drawn point (MAD floor from MEASUREMENTS[].floor), flags written
+   *      back into each series (1 high, 2 low);
+   *   5. y range from the unflagged points plus every spec value, padded by max(10% of range, minPad);
+   *   6. pin rule: a flagged point within 0.5 x the core range of the axis stays on scale (flag 3) and the
+   *      axis is re-padded around it; the rest are counted in outliers.nPinned and drawn off-scale by chart.js;
+   *   7. exclude mode drops the flagged points from the series entirely;
+   *   8. series labels "MACHINE (n coils, n pts)" recomputed over the included rows;
+   *   9. optional stats (describe() per machine + 'All machines'): capability uses the latest spec revision,
+   *      pass / fail the limit of each row's own date; footnotes describe the outlier, runs and spec settings.
+   * Returns the spec consumed by chart.js: { title1, title2, series, lsl, usl (specLines), xMin, xMax, yMin,
+   * yMax, missingSpec, fileName, relPath, machine, measurement, units, decimals, yLabel, port, runs, runsCoils,
+   * outlierMode, outliers, stats, statsOutliers, excludedNote }. Pure: neither g nor the model is mutated.
    */
   Model.prototype.chartSpec = function (coilResult, g, onlyMachine, opts) {
     opts = opts || {};
@@ -655,7 +756,10 @@
     };
   };
 
-  /* Row detail for tooltips. */
+  /* Row detail for tooltips.
+   * m: machine index, idx: row index into that machine's dataset for `measurement`. Resolves the dictionary
+   * ids back to strings and returns { machine, time, meas, sn, lsl, usl, units, port, pf, extras }.
+   */
   Model.prototype.rowInfo = function (m, idx, measurement) {
     measurement = measurement || 'Sensitivity';
     var ds = this.machines[m].datasets[measurement];
@@ -682,6 +786,8 @@
    * fails when any row fails, passes when at least one row is judged and none fails, else it is unjudged.
    * Rows without a serial number cannot be attributed to a coil and are left out. */
   CATE.RUN_GAP_MINUTES = 15;
+  /* Verdict of one row: 1 pass, 0 fail, -1 unjudged. The tester's PassFail column wins when recorded; otherwise
+   * the value is compared with the row's own LSL / USL (NaN = no limit; no limit on either side = unjudged). */
   function rowVerdict(ds, idx) {
     var pf = ds.pf ? ds.pf[idx] : -1;
     if (pf >= 0) return pf;
@@ -689,6 +795,17 @@
     if (l !== l && u !== u) return -1;
     return ((l === l && y < l) || (u === u && y > u)) ? 0 : 1;
   }
+  /* Reconstruct the test runs of every coil type (rules in the section comment above).
+   * gapMs: idle time that ends a run (default CATE.RUN_GAP_MINUTES). Cached on this._runs and reused while
+   * the model version and gapMs are unchanged.
+   * For each coil id the rows of every loaded dataset (dsList, in machine and MEASUREMENT_ORDER) that carry a
+   * serial number are gathered into parallel arrays time / src (dsList index) / row / sc (cleaned serial id),
+   * then an index `order` is sorted by cleaned serial, then time. Walking that order, a new run starts when
+   * the serial changes, the gap to the previous row exceeds gapMs, or the row's measurement key
+   * (table|mode|tc|chan|elem|net) was already seen in the current run at an earlier time. Each run records
+   * { sc, sn (raw id of its first row), m (machine of its first row), t0, t1, start / end (slice of `order`),
+   * n, verdict (1 / 0 / -1), failMask and judgedMask (one bit per MEASUREMENT_ORDER index), machineMask }.
+   * Returns { version, gapMs, dsList, coils: [{ runs, order, src, row, time, n }] } indexed by coil id. */
   Model.prototype.runs = function (gapMs) {
     gapMs = gapMs > 0 ? gapMs : CATE.RUN_GAP_MINUTES * 60000;
     if (this._runs && this._runs.version === this.version && this._runs.gapMs === gapMs) return this._runs;
@@ -748,7 +865,11 @@
    * labels, names, mistyped entries) is a dummy serial, left out of the yield by default. */
   CATE.SERIAL_FORMAT = /^\d{1,5}(-\d+)?$/;
   CATE.SERIAL_DUMMY = /test|tst|eval/i;
+  /* Default dummy rule for the yield report and the serial picker: true when sn matches SERIAL_DUMMY or fails SERIAL_FORMAT. */
   CATE.isDummySerial = function (sn) { return CATE.SERIAL_DUMMY.test(sn) || !CATE.SERIAL_FORMAT.test(sn); };
+  /* Normalise an excludeSn spec into a predicate (raw serial string -> boolean), or null when nothing is
+   * excluded: a function is used as is, a RegExp is tested, an array / Set of strings becomes a
+   * case-insensitive membership test. */
   function serialPredicate(spec) {
     if (!spec) return null;
     if (typeof spec === 'function') return spec;
@@ -788,18 +909,32 @@
     return out;
   };
 
+  /* First pass yield report (counting rules in the comment above CATE.TEST_KIT_PATTERN).
+   * Returns { coils: [agg], total: agg, skippedTestKits, gapMs, machine, tables, version } where agg =
+   * { coil, coilId, start, endIncl, override, tested, judged, firstPass, firstFail, unjudged, retested,
+   *   finalPass, runs, runsFailed, excluded, fpyPct, finalPct, byMeas, byMachine, failTests }.
+   * How it works: for every coil type (test kits skipped unless includeTestKits) the runs from runs() are
+   * grouped by cleaned serial, honouring the machine filter; runs recorded under an excluded raw serial are
+   * dropped (a serial whose runs all drop out is not tested; drops inside the range count in `excluded`).
+   * A serial is tested when its first remaining run starts inside the coil's range; that first run decides
+   * firstPass / firstFail / unjudged, the per-machine and per-measurement counts and the failing test labels,
+   * its last run decides finalPass. Per-coil aggregates roll into `total`, then rates() derives the
+   * percentages. Coils are sorted by tested count descending, then name. */
   Model.prototype.yieldReport = function (settings, opts) {
     opts = opts || {};
     var R = this.runs(opts.gapMs), self = this, dict = this.dict;
     var onlyM = typeof opts.machine === 'number' && opts.machine >= 0 ? opts.machine : -1;
     var excluded = serialPredicate(opts.excludeSn);
     var ORDER = CATE.MEASUREMENT_ORDER, NMEAS = ORDER.length;
+    /* Empty aggregate for one coil type (or the total) with per-measurement and per-machine counters. */
     function newAgg(name) {
       return { coil: name, tested: 0, judged: 0, firstPass: 0, firstFail: 0, unjudged: 0, retested: 0, finalPass: 0, runs: 0, runsFailed: 0, excluded: 0,
                byMeas: ORDER.map(function (k) { return { measurement: k, label: CATE.MEASUREMENTS[k].label, judged: 0, failed: 0 }; }),
                byMachine: CATE.MACHINES.map(function (nm) { return { machine: nm, tested: 0, pass: 0, fail: 0 }; }),
                failTests: new Map(), fpyPct: NaN, finalPct: NaN };
     }
+    /* Finish an aggregate: derive judged / fpyPct / finalPct, drop empty per-measurement and per-machine rows
+     * and turn failTests into a list sorted by coil count. Mutates and returns a. */
     function rates(a) {
       a.judged = a.firstPass + a.firstFail;
       a.fpyPct = a.judged ? a.firstPass / a.judged * 100 : NaN;
@@ -810,6 +945,7 @@
         .sort(function (x, y) { return y.coils - x.coils || cmpStr(x.test, y.test); });
       return a;
     }
+    /* Label of one row's test, e.g. "Sensitivity · Mode 1 · TC03 Ch1 E2" or "SCPre · Mode 1 · Net X". */
     function testLabel(e, ds, idx) {
       var MEAS = CATE.MEASUREMENTS[e.k];
       var head = MEAS.label + ' · Mode ' + dict.mode.list[ds.mode[idx]] + ' · ';
@@ -878,7 +1014,10 @@
              tables: this.measurementsLoaded().map(function (k) { return CATE.MEASUREMENTS[k].label; }), version: this.version };
   };
 
-  /* Summaries (charts_generated_by_coil / by_coil_mode) */
+  /* Summaries (charts_generated_by_coil / by_coil_mode)
+   * From a build() result: byCoil = [{ coil, charts, rows }] and byCoilMode = [{ coil, mode, charts }] for
+   * coils that produced at least one chart, mirroring the two summary CSVs the Python script wrote.
+   */
   function summaryRows(build) {
     var byCoil = [], byCoilMode = [];
     build.coils.forEach(function (c) {
@@ -891,13 +1030,16 @@
     return { byCoil: byCoil, byCoilMode: byCoilMode };
   }
 
+  /* Quote a CSV field when it holds a comma, quote or line break (quotes doubled). */
   function csvEscape(v) { v = String(v); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+  /* Serialise rows (objects) to CSV text in the given column order; CRLF line endings, missing values empty. */
   function toCsv(rows, cols) {
     var lines = [cols.join(',')];
     rows.forEach(function (r) { lines.push(cols.map(function (c) { return csvEscape(r[c] === undefined ? '' : r[c]); }).join(',')); });
     return lines.join('\r\n') + '\r\n';
   }
 
+  /* Public surface: the Model class, the shared instance and the helpers other modules and tests reuse. */
   CATE.Model = Model;
   CATE.model = new Model();
   CATE.makeSafeName = makeSafeName;

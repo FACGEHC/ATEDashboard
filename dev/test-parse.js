@@ -1,10 +1,17 @@
 // Node test for parse-core.js:  node dev/test-parse.js [path/to/CATE1007.csv]
+// Synthetic checks of the CSV parser used by the dashboard (same code as the Web Worker): the TimeDate
+// parser, parseNum, the quote-aware record scanner, chunk-boundary robustness (the same file parsed with
+// 7-byte, 64-byte and 1 MB chunks must give identical datasets), measurement detection from file name /
+// columns / units, one small CSV per result table (CATE, EVO Noise / Oscillation / TestedLine), the cp1252
+// fallback and the multi-table bundle format (#table= markers or a repeated header row). With a real CSV
+// path the file is parsed once and its row counts and timings are printed. Prints ALL PASSED or N FAILURE(S).
 const path = require('path');
 const fs = require('fs');
 const cateParseCore = require('../js/parse-core.js');
 const core = cateParseCore();
 
 let fails = 0;
+// Assertion helper: deep-equal via JSON (NaN == NaN allowed); counts failures, prints ok / FAIL with both values.
 function eq(a, b, msg) {
   const ok = (Number.isNaN(a) && Number.isNaN(b)) || a === b || JSON.stringify(a) === JSON.stringify(b);
   if (!ok) { fails++; console.error('FAIL', msg, '\n  got     ', a, '\n  expected', b); }
@@ -12,6 +19,7 @@ function eq(a, b, msg) {
 }
 
 // --- date parser
+// U(y, m, d, h, mi, s): UTC timestamp in ms, the form parseDate returns.
 const U = (y, m, d, h = 0, mi = 0, s = 0) => Date.UTC(y, m - 1, d, h, mi, s);
 eq(core.parseDate('4/3/2024 10:03:23 AM'), U(2024, 4, 3, 10, 3, 23), 'basic AM');
 eq(core.parseDate('12/7/2016 10:35:26 AM'), U(2016, 12, 7, 10, 35, 26), 'two-digit month');
@@ -33,6 +41,7 @@ eq(core.parseNum(''), NaN, 'empty -> NaN (not 0)');
 eq(core.parseNum('abc'), NaN, 'junk -> NaN');
 
 // --- scanner
+// Runs the scanner over a text and returns the records emitted plus the number of characters consumed.
 function records(text) { const out = []; const consumed = core.scan(text, f => out.push(f)); return { out, consumed }; }
 let r = records('a,b,c\n1,"x, y",3\n');
 eq(r.out, [['a', 'b', 'c'], ['1', 'x, y', '3']], 'comma inside quotes');
@@ -52,6 +61,8 @@ r = records('\n\na,b\n');
 eq(r.out, [['a', 'b']], 'blank lines skipped');
 
 // --- chunk-boundary robustness: parse a synthetic file with tiny chunks
+// Parses a Blob with parse-core using the given chunk size and returns the dataset message (with the
+// sequence of message types attached as .messages) or, without a dataset, the last message (an error).
 async function parseBlob(blob, chunkSize, opts) {
   const msgs = [];
   await core.parseFile(blob, (m) => msgs.push(m), Object.assign({ chunkSize }, opts || {}));
@@ -73,6 +84,7 @@ eq(core.detectMeasurement('x.csv', ['CoilName', 'TestedLine', 'LSL', 'Measuremen
 eq(core.detectMeasurement('x.csv', ['CoilName', 'TestedLine', 'LSL', 'Measurement']), 'MEMSSC', 'detect: TestedLine without USL -> MEMSSC');
 eq(core.detectMeasurement('EVO1001_MEMSCurrentResults.csv', ['CoilName', 'TestedLine']), 'MEMSCurrent', 'detect: MEMSCurrent by file name');
 eq(core.detectMeasurement('subtest_data.csv', ['CoilName', 'TestCase', 'LSL', 'USL']), null, 'detect: "bte" inside another word is not a token');
+// Async checks: synthetic CSVs for every table, the optional real file, and the bundle format.
 (async () => {
   const header = '"AutoNumber","CoilName","CoilSN","CoilPN","Mode","Operator","TimeDate","TestCase","Channel","Element","Measurement","LSL","USL","PassFail","Units"\r\n';
   const rows = [

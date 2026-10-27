@@ -34,6 +34,7 @@ MEMO = set()   # every column is TEXT(255)
 
 
 def cate_date(iso):
+    """ATML ISO timestamp -> CATE TimeDate text ('M/D/YYYY h:mm:ss AM'); the input is returned when it does not parse."""
     try:
         dt = datetime.strptime(iso[:23], '%Y-%m-%dT%H:%M:%S.%f') if '.' in iso else datetime.strptime(iso[:19], '%Y-%m-%dT%H:%M:%S')
     except ValueError:
@@ -43,6 +44,7 @@ def cate_date(iso):
 
 
 def datum(d):
+    """Text of a c:Datum element: its value attribute, else the nested c:Value; None without an element."""
     if d is None:
         return None
     if 'value' in d.attrib:
@@ -52,6 +54,7 @@ def datum(d):
 
 
 def limits(tr):
+    """(lo, hi, expected) of a TestResult from its LimitPair / SingleLimit comparators and Expected datum."""
     lo = hi = exp = None
     for lim in tr.findall('tr:TestLimits/tr:Limits/c:LimitPair/c:Limit', NS) + tr.findall('tr:TestLimits/tr:Limits/c:SingleLimit', NS):
         cmp_, val = lim.get('comparator'), datum(lim.find('c:Datum', NS))
@@ -66,6 +69,7 @@ def limits(tr):
 
 
 def pf(el):
+    """tr:Outcome -> PASS / FAIL, other outcomes as the upper-cased qualifier (or value)."""
     if el is None:
         return ''
     v, q = el.get('value'), el.get('qualifier') or ''
@@ -73,6 +77,7 @@ def pf(el):
 
 
 def num(s):
+    """float(s) or None when the text is not numeric (NA, empty, None)."""
     try:
         return float(s)
     except (TypeError, ValueError):
@@ -80,10 +85,12 @@ def num(s):
 
 
 def f2(x):
+    """Two-decimal text, matching the converter's F2 format."""
     return '%.2f' % x
 
 
 def channel_of(cfg):
+    """Comma-joined P1 / P2 channel list of the 'bias' (else 'mux') section of a test configuration; '' when none."""
     for k in ('bias', 'mux'):
         o = cfg.get(k) if isinstance(cfg, dict) else None
         if not isinstance(o, dict):
@@ -99,6 +106,7 @@ def channel_of(cfg):
 
 
 def net_of(cfg, fallback):
+    """First entry of the configuration's power list (the supply net), else fallback."""
     pw = cfg.get('power') if isinstance(cfg, dict) else None
     if isinstance(pw, list) and pw and isinstance(pw[0], list) and pw[0] and pw[0][0] not in (None, ''):
         return str(pw[0][0])
@@ -110,6 +118,9 @@ def jnum(v):
     return '' if v is None else str(v)
 
 
+# Independent re-implementation of AtmlParser.Parse: same two-pass walk (element -> biased channel map,
+# then one row per Test keyed by test group name), same file-name fallback for PN / SN and the same Noise
+# baseline arithmetic, written from the ATML structure rather than copied from the C# code.
 def expected_rows(path):
     """{RunID: {table: [tuple(values)...]}} derived from one report."""
     root = ET.parse(path).getroot()
@@ -178,6 +189,7 @@ def expected_rows(path):
                 base = {'CoilName': coil_name, 'CoilSN': coil_sn, 'CoilPN': coil_pn, 'Mode': mode, 'Operator': operator,
                         'TimeDate': cate_date(t.get('startDateTime', '')), 'PassFail': pf(t.find('tr:Outcome', NS)), 'Port': port, 'RunID': run}
 
+                # add(table, **cols): one row in the table's column order, missing values as ''
                 def add(table, **kv):
                     row = dict(base); row.update(kv)
                     tables[table].append(tuple(row.get(c) if row.get(c) is not None else '' for c in TABLES[table]))
@@ -224,10 +236,12 @@ def expected_rows(path):
 
 
 def truncate(v, col):
+    """Apply the converter's TEXT(255) truncation to an expected value."""
     return v if col in MEMO or len(v) <= 255 else v[:255]
 
 
 def same(table, col, a, b):
+    """Field comparison; the computed Noise columns tolerate a rounding difference of one unit in the last place."""
     if (table, col) in COMPUTED:
         fa, fb = num(a), num(b)
         if fa is not None and fb is not None:
@@ -245,6 +259,8 @@ def find_csv(csv_dir, table):
 
 
 def main():
+    """Load the converter's CSVs grouped by RunID, re-parse every source report, compare per run and table,
+    check SourceFiles.Rows and duplicate RunIDs, and verify that files skipped as empty really are empty."""
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     if not args:
         print(__doc__); sys.exit(2)

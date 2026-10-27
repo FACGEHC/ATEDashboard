@@ -2,18 +2,26 @@
 // produced by tools/export_mdb.ps1.
 //   node dev/test-jet.js ../data/CATE_1001.mdb ../data/ref/CATE1001 [TableName ...]
 // Without arguments only the self-contained unit checks run.
+// How it works: (1) unit checks of the text decoder (compressed / UTF-16 / cp1252 forms) and of rowSpan +
+// decodeRow on a hand-built 4 KB data page; (2) with an .mdb, every result table is scanned through
+// jet-core and its rows are indexed by AutoNumber, then the matching reference CSV (<machine>_<Table>.csv
+// from tools/export_mdb.ps1) is streamed and each row is looked up field for field; big tables compare
+// FNV hashes instead of full strings to save memory. Tables without a reference CSV are only counted
+// against the TDEF row count. Exit code 1 and "N FAILURE(S)" on any mismatch, else "ALL PASSED".
 const fs = require('fs');
 const path = require('path');
 const cateJetCore = require('../js/jet-core.js');
 const jet = cateJetCore();
 
 let fails = 0;
+// Assertion helper: deep-equal via JSON (NaN == NaN allowed); counts failures, prints ok / FAIL with both values.
 function eq(a, b, msg) {
   const ok = (Number.isNaN(a) && Number.isNaN(b)) || a === b || JSON.stringify(a) === JSON.stringify(b);
   if (!ok) { fails++; console.error('FAIL', msg, '\n  got     ', a, '\n  expected', b); } else console.log('ok  ', msg);
 }
 
 // ---------- unit checks: text decoding
+// B(...bytes): shorthand for a Uint8Array literal.
 const B = (...xs) => Uint8Array.from(xs);
 eq(jet.decodeText(B(0xFF, 0xFE, 0x41, 0x42, 0x43), 0, 5), 'ABC', 'compressed ascii');
 eq(jet.decodeText(B(0xFF, 0xFE, 0x41, 0x00, 0x3B, 0x03, 0x00, 0x42), 0, 8), 'A̻B', 'compressed with a UTF-16 segment');
@@ -22,6 +30,9 @@ eq(jet.decodeText(B(0xFF, 0xFE, 0xB0), 0, 3), '°', 'compressed cp1252 degree si
 eq(jet.decodeText(B(), 0, 0), '', 'empty');
 
 // ---------- unit check: a hand-built data page with one row of [LONG, TEXT, TEXT(null)]
+// Assembles a single-row data page by hand (row bytes grow from the page end, offsets table after the
+// variable-length data) and checks that rowSpan finds it and decodeRow returns the fields in the
+// requested order with the null mask applied.
 (function () {
   const PG = 4096, page = new Uint8Array(PG);
   page[0] = 0x01; page[4] = 80;                       // data page owned by TDEF page 80
@@ -56,6 +67,8 @@ eq(jet.decodeText(B(), 0, 0), '', 'empty');
 // ---------- reference comparison
 const mdbPath = process.argv[2], refDir = process.argv[3];
 const only = process.argv.slice(4);
+// Without an .mdb path the unit checks are the whole run; otherwise the file is opened through a
+// read(offset, length) source backed by fs.readSync and every table is compared with its reference CSV.
 if (!mdbPath) { finish(); }
 else (async () => {
   const fd = fs.openSync(mdbPath, 'r'); const size = fs.fstatSync(fd).size;
@@ -118,19 +131,25 @@ else (async () => {
   finish();
 })().catch(e => { console.error('ERROR', e); process.exit(1); });
 
+// Prints the verdict and exits 1 when any check failed.
 function finish() { console.log(fails ? `\n${fails} FAILURE(S)` : '\nALL PASSED'); process.exit(fails ? 1 : 0); }
+// 32-bit FNV-1a hash of a string (row fingerprint for large tables).
 function fnv(s) { let h = 0x811c9dc5; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) >>> 0; } return h; }
+// Finds <Table>.csv or <anything>_<Table>.csv (case-insensitive) in the reference folder, or null.
 function findRef(dir, table) {
   const cands = fs.readdirSync(dir).filter(f => f.toLowerCase() === (table + '.csv').toLowerCase() || f.toLowerCase().endsWith('_' + table.toLowerCase() + '.csv'));
   return cands.length ? path.join(dir, cands[0]) : null;
 }
+// Reads the row count written by export_mdb.ps1 (<Table>.count.txt) or null when absent.
 function readCount(dir, table) {
   const c = fs.readdirSync(dir).filter(f => f.toLowerCase().endsWith(table.toLowerCase() + '.count.txt'));
   return c.length ? parseInt(fs.readFileSync(path.join(dir, c[0]), 'utf8'), 10) : null;
 }
+// Returns the header record of a CSV (stops the stream after the first record).
 async function readHeader(file) { let h = null; await streamCsv(file, () => false, (f) => { h = f; return false; }); return h; }
 /* Minimal streaming CSV reader for the exporter's output (every field quoted, "" escapes, CRLF).
  * onHeader (optional) gets the first record; onRow every later one. Returning false stops the read. */
+// Chunks (4 MB) are scanned with a quote-aware state machine; an incomplete trailing record is carried over to the next chunk.
 async function streamCsv(file, onRow, onHeader) {
   const rs = fs.createReadStream(file, { encoding: 'utf8', highWaterMark: 1 << 22 });
   let carry = '', first = true, stop = false;

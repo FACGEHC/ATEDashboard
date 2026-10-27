@@ -1,4 +1,31 @@
 <!DOCTYPE html>
+<!--
+  dev/ui-test.html: browser harness for the dashboard. Loads ../CATEDASHBOARD.html in a full-size iframe,
+  feeds it the excerpts from sample-data.js (built by dev/make-sample.js) through app.loadFiles() as if
+  they had been dropped, then drives the UI from query-string parameters and logs what it sees to the
+  console. Usually run headless: node dev/headless.js --url "file:///.../dev/ui-test.html?coil=1.5T%20GEM%20PA"
+  --until "ui ready" --out shot.png; document.title becomes "ui ready" when the scripted steps are done
+  (or "mdb ready" after an mdb= load), which is what headless.js waits for.
+
+  Query-string parameters (all optional, combine freely):
+    nowork              block Web Workers (parse on the main thread)     sensonly   Sensitivity CSVs only
+    partial             leave CATE1001 out, then load it later to show the partial-data banner
+    nosample            start empty (use with mdb=)                      watch      log loader state every second
+    dates=A..B          type a date range (YYYY-MM-DD)                   noov       drop the per-coil overrides
+    preset=all|last7|last30|ytd   click that preset                      meas=<name>  switch the measurement
+    coil=<name>         open the viewer on that coil ("coil" alone opens 1.5T GEM HNU)
+    chart=<mode>/<key>  go to that chart       machine=<name>  machine filter      runs=all|latest|first
+    outliers=flag|exclude|off  k=<n>  stats=0|1  statsout=0|1   outlier / statistics options
+    lib                 library view           thenmeas=<name>  pick a measurement after the coil opened
+    hover=outlier:N | hover=X,Y   move the pointer onto a point and log the tooltip position
+    yield=1             open the Yield tab; with ygap=<min>, yexclude=<sn,...>[&yrule=1], ykits=1,
+                        ymachine=<name>, yopen=<coil> (expand its row), ydd=1|<search> (open the exclude
+                        dropdown), scroll=<px> (scroll the main pane)
+    covchip=<machine>/<meas>  covsel=<machine>  covopen=<coil>   clicks in the overview's Data coverage table
+    pinslot=<machine>   keep that machine's file details open    overrides[&ovshow]  open the overrides box
+    mdb=<file:// url>   fetch a real .mdb and load it through the worker path; then mdbmeas=, mdbcoil=,
+                        mdbchart=<mode>/<key>, mdbcov=<machine>, stats=1 apply to the loaded data
+-->
 <html>
 <head>
 <meta charset="utf-8">
@@ -9,9 +36,12 @@
 <iframe id="f" src="../CATEDASHBOARD.html"></iframe>
 <script src="sample-data.js"></script>
 <script>
+// Everything runs once the dashboard iframe (and sample-data.js) is ready; see onFrameLoad at the bottom.
 (function () {
   var q = location.search;
   var f = document.getElementById('f');
+  // Entry point once the dashboard iframe exists: turns the sample texts into File objects, hands them to
+  // the app, then waits for the first build before applying the query-string steps.
   function onFrameLoad() {
     var w = f.contentWindow, app = w.cateApp;
     console.log('UI iframe loaded, app=' + !!app);
@@ -30,6 +60,8 @@
       }, 1000);
     }
     // preset=all|last7|last30|ytd: click that date-range preset, then rebuild synchronously
+    // Applies dates=A..B / noov (typed into the date inputs, overrides cleared) and preset=<name> (clicks the
+    // sidebar preset button), rebuilding synchronously and logging the resulting range and chart count.
     function applyPreset() {
       var dr = /dates=(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})/.exec(q);   // dates=YYYY-MM-DD..YYYY-MM-DD: type a date range; noov drops the per-coil overrides
       if (dr || /noov/.test(q)) {
@@ -45,6 +77,9 @@
       else console.log('preset ' + pr[1] + ' not found');
     }
     var tries = 0;
+    // Polls every 50 ms (up to 400 tries) until the loader is idle and a build exists, then runs the
+    // scripted steps in order: preset, measurement, coil / viewer options, yield tab, overview clicks;
+    // 300 ms later the hover step, the "ui ready" title and the optional mdb= load.
     (function waitBuild() {
       if ((app.state.build || !files.length) && !app.loader.isBusy()) {   // nosample: nothing to build yet
         console.log('UI build: ' + (app.state.build ? app.state.build.totalCharts : 'none') + ' charts');
@@ -136,6 +171,8 @@
               console.log('fetched ' + name + ' ' + blob.size + ' bytes in ' + (Date.now() - tFetch) + ' ms');
               var tLoad = Date.now(), lastLog = 0;
               app.loadFiles([new w.File([blob], name)]);
+              // Polls the loader until the .mdb has finished and a build exists (progress logged every 5 s),
+              // then opens the requested chart and sets the title to "mdb ready".
               (function poll() {
                 var m = app.loader.slots.filter(function (s) { return s.status !== 'empty'; });
                 var busy = app.loader.isBusy();

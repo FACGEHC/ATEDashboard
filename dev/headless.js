@@ -5,11 +5,20 @@
 //   node dev/headless.js --url "file:///.../dev/ui-test.html?coil=1.5T%20GEM%20PA" --until "ui ready" --out shot.png [--timeout 120000] [--width 1500 --height 1050]
 //
 // Chrome is found via CHROME env var or the default install path.
+//
+// How it works: Chrome is spawned with a fresh temporary profile and --remote-debugging-port, a new target
+// is created through the HTTP endpoint and driven over its WebSocket (Runtime / Page / Emulation domains).
+// Every console message of the page (and of the dashboard iframe, via Target.setAutoAttach) is echoed as
+// "[log] ..." / "[exception] ...", so a run can be checked with grep. The page signals completion by setting
+// document.title (ui-test.html -> "ui ready" / "mdb ready", render-test.html -> "render test done").
+// Exit code: 0 title reached, 2 usage error, 3 timeout (the screenshot is still saved).
+// Used by the dev smoke tests; dev/ui-test.html and dev/render-test.html are the usual targets.
 const { spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
 
+// --key value pairs from the command line (no validation beyond --url being required).
 const args = {};
 for (let i = 2; i < process.argv.length; i += 2) args[process.argv[i].replace(/^--/, '')] = process.argv[i + 1];
 const url = args.url, until = args.until || 'ui ready', out = args.out || 'headless.png';
@@ -21,9 +30,13 @@ const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'cate-headless-'));
 const proc = spawn(chrome, ['--headless=new', '--remote-debugging-port=' + port, '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check',
   '--allow-file-access-from-files', '--disable-gpu', '--hide-scrollbars', '--window-size=' + width + ',' + height, 'about:blank'], { stdio: 'ignore' });
 let exitCode = 1;
+// Stops Chrome, removes the temporary profile shortly after (Chrome needs a moment to release it) and
+// exits with the code set by the main flow (1 until the run finishes). Also bound to Ctrl-C.
 function cleanup() { try { proc.kill(); } catch (e) { /* ignore */ } setTimeout(() => { try { fs.rmSync(profile, { recursive: true, force: true }); } catch (e) { /* ignore */ } process.exit(exitCode); }, 300); }
 process.on('SIGINT', cleanup);
 
+// Polls the DevTools HTTP endpoint (/json/version) every 200 ms for up to 20 s until Chrome answers;
+// returns the version object, throws when the endpoint never comes up.
 async function waitForDevTools() {
   for (let i = 0; i < 100; i++) {
     try { const r = await fetch('http://127.0.0.1:' + port + '/json/version'); if (r.ok) return await r.json(); } catch (e) { /* not up yet */ }
@@ -32,12 +45,15 @@ async function waitForDevTools() {
   throw new Error('Chrome DevTools endpoint did not come up');
 }
 
+// Main flow: open a tab, attach, navigate, poll document.title until it equals --until, screenshot, clean up.
 (async () => {
   await waitForDevTools();
   const target = await (await fetch('http://127.0.0.1:' + port + '/json/new?about:blank', { method: 'PUT' })).json();
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
   let seq = 0; const pending = new Map();
+  // Routes DevTools messages: replies (by id) settle the matching pending promise; console and exception
+  // events are printed with a [type] prefix.
   ws.onmessage = (ev) => {
     const m = JSON.parse(ev.data);
     if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); if (m.error) p.rej(new Error(m.error.message)); else p.res(m.result); return; }
@@ -48,6 +64,7 @@ async function waitForDevTools() {
       console.log('[exception] ' + (m.params.exceptionDetails.exception && m.params.exceptionDetails.exception.description || m.params.exceptionDetails.text));
     }
   };
+  // send(method, params): one DevTools command as a promise, correlated by the sequence id.
   const send = (method, params) => new Promise((res, rej) => { const id = ++seq; pending.set(id, { res, rej }); ws.send(JSON.stringify({ id, method, params: params || {} })); });
   await send('Runtime.enable'); await send('Page.enable');
   await send('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: false });
